@@ -40,5 +40,7 @@ for linedata in wave_dataset:
 
     processed_dataset.append(linedata_abs)
 
-plt.plot(processed_dataset[random.randint(0, int(len(processed_dataset) / 2) - 1)])
+seed = random.randint(0, len(processed_dataset) - 1)
+print(seed)
+plt.plot(processed_dataset[seed])
 plt.show()

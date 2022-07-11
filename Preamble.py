@@ -38,5 +38,7 @@ for fname in ["C:/Pycharm BindsNET/Wi-Fi_Preambles/"
 
     f.close()
 
-plt.plot(processed_dataset[random.randint(0, len(processed_dataset) - 1)])
+seed = random.randint(0, int(len(processed_dataset) / 2) - 1)
+print(seed)
+plt.plot(processed_dataset[seed])
 plt.show()
