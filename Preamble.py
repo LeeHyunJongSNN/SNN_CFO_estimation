@@ -1,6 +1,7 @@
 import numpy as np
 from matplotlib import pyplot as plt
 from scipy.signal import detrend
+import random
 
 processed_dataset = []
 classes = []
@@ -37,5 +38,5 @@ for fname in ["C:/Pycharm BindsNET/Wi-Fi_Preambles/"
 
     f.close()
 
-plt.plot(processed_dataset[0])
+plt.plot(processed_dataset[random.randint(0, len(processed_dataset) - 1)])
 plt.show()

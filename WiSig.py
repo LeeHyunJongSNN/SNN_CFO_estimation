@@ -2,8 +2,9 @@ import pickle
 import numpy as np
 from matplotlib import pyplot as plt
 from scipy.signal import detrend
+import random
 
-fname = "C:/Pycharm BindsNET/WiSig/Full/dataset_2021_03_23_node23-1.pkl"
+fname = "C:/Pycharm BindsNET/WiSig/Full/dataset_2021_03_23_node23-5.pkl"
 with open(fname, "rb") as f:
     load_data = pickle.load(f)
 
@@ -39,5 +40,5 @@ for linedata in wave_dataset:
 
     processed_dataset.append(linedata_abs)
 
-plt.plot(processed_dataset[0])
+plt.plot(processed_dataset[random.randint(0, int(len(processed_dataset) / 2) - 1)])
 plt.show()
