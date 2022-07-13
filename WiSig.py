@@ -21,7 +21,7 @@ for k in range(int(len(temp) / 2)):
     iq_form = complex(temp[2 * k - 1], temp[2 * k])
     wave.append(iq_form)
 
-wave_dataset = [wave[i:i + 256] for i in range(0, len(wave), 256)]
+wave_dataset = [wave[j:j + 256] for j in range(0, len(wave), 256)]
 processed_dataset = []
 
 # linedata_fft = np.fft.fft([x for x in linedata[0:len(linedata) - 1]])
