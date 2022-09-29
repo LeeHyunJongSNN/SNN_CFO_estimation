@@ -1,12 +1,12 @@
 import numpy as np
 
-shifting = 160
+shifting = 20
 
 dataset = []
 
 fname = " "
 for fname in ["/home/leehyunjong/Wi-Fi_Preambles/"
-              "WIFI_10MHz_IQvector_6dB_20000.txt"]:
+              "WIFI_10MHz_IQvector_18dB_20000.txt"]:
 
     print(fname)
     f = open(fname, "r", encoding='utf-8-sig')
@@ -26,8 +26,9 @@ for fname in ["/home/leehyunjong/Wi-Fi_Preambles/"
 
 dataset = np.array(dataset)
 
+dataset[0:10000, shifting:320] = dataset[00000:10000, 0:320 - shifting]
 dataset[0:10000, 0:shifting] = dataset[10000:20000, 0:shifting]
 
-fname = str(shifting) + "_Shifted_WIFI_10MHz_IQvector_6dB_20000.txt"
+fname = str(shifting) + "_Shifted_WIFI_10MHz_IQvector_18dB_20000.txt"
 
 np.savetxt(fname, dataset, fmt='%s', delimiter=' ')
