@@ -25,9 +25,11 @@ for fname in ["/home/leehyunjong/Wi-Fi_Preambles/"
     f.close()
 
 dataset = np.array(dataset)
+whole = np.size(dataset, 0)
+half  = int(whole / 2)
 
-dataset[0:10000, shifting:320] = dataset[00000:10000, 0:320 - shifting]
-dataset[0:10000, 0:shifting] = dataset[10000:20000, 0:shifting]
+dataset[0:half, shifting:320] = dataset[0:half, 0:320 - shifting]
+dataset[0:half, 0:shifting] = dataset[half:whole, 0:shifting]
 
 fname = str(shifting) + "_Shifted_WIFI_10MHz_IQvector_18dB_20000.txt"
 
