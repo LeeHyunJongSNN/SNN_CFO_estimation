@@ -1,0 +1,51 @@
+id: customs_ofdm_carrier_preamble
+label: OFDM Carrier Preamble
+category: '[Customs]'
+
+templates:
+  imports: from gnuradio import customs
+  make: customs.ofdm_carrier_preamble(${fft_len}, ${occupied_carriers}, ${pilot_carriers},
+    ${pilot_symbols}, ${sync_words}, ${len_tag_key}, ${output_is_shifted})
+    
+parameters:
+-   id: fft_len
+    label: FFT length
+    dtype: int
+    default: fft_len
+    hide: ${ 'part' if fft_len == 1 else 'none' }
+-   id: occupied_carriers
+    label: Occupied Carriers
+    dtype: raw
+-   id: pilot_carriers
+    label: Pilot Carriers
+    dtype: raw
+    default: ((),)
+-   id: pilot_symbols
+    label: Pilot Symbols
+    dtype: raw
+    default: ((),)
+-   id: sync_words
+    label: Sync Words
+    dtype: raw
+    default: ((),)
+-   id: len_tag_key
+    label: Length tag key
+    dtype: string
+    default: '"packet_len"'
+-   id: output_is_shifted
+    label: Shift Output
+    dtype: enum
+    default: 'True'
+    options: ['False', 'True']
+    option_labels: ['No', 'Yes']
+
+inputs:
+-   domain: stream
+    dtype: complex
+
+outputs:
+-   domain: stream
+    dtype: complex
+    vlen: ${ fft_len }
+
+file_format: 1

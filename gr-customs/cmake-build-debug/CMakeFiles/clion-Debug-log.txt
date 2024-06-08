@@ -1,0 +1,44 @@
+/Applications/CLion.app/Contents/bin/cmake/mac/aarch64/bin/cmake -DCMAKE_BUILD_TYPE=Debug -DCMAKE_MAKE_PROGRAM=/Applications/CLion.app/Contents/bin/ninja/mac/aarch64/ninja -G Ninja -S /Users/leehyeonjong/gr-customs -B /Users/leehyeonjong/gr-customs/cmake-build-debug
+-- Using GMP.
+-- User set python executable /Users/leehyeonjong/radioconda/bin/python
+CMake Warning (dev) at /Users/leehyeonjong/radioconda/lib/cmake/gnuradio/GrPython.cmake:21 (find_package):
+  Policy CMP0148 is not set: The FindPythonInterp and FindPythonLibs modules
+  are removed.  Run "cmake --help-policy CMP0148" for policy details.  Use
+  the cmake_policy command to set the policy and suppress this warning.
+
+Call Stack (most recent call first):
+  /Users/leehyeonjong/radioconda/lib/cmake/gnuradio/GnuradioConfig.cmake:37 (include)
+  CMakeLists.txt:37 (find_package)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+CMake Warning (dev) at /Users/leehyeonjong/radioconda/lib/cmake/gnuradio/GrPython.cmake:27 (find_package):
+  Policy CMP0148 is not set: The FindPythonInterp and FindPythonLibs modules
+  are removed.  Run "cmake --help-policy CMP0148" for policy details.  Use
+  the cmake_policy command to set the policy and suppress this warning.
+
+Call Stack (most recent call first):
+  /Users/leehyeonjong/radioconda/lib/cmake/gnuradio/GnuradioConfig.cmake:37 (include)
+  CMakeLists.txt:37 (find_package)
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Using install prefix: /usr/local
+-- Building for version: 1.0.0.0 / 1.0.0
+-- No C++ unit tests... skipping
+-- PYTHON and GRC components are enabled
+-- Python checking for pygccxml - not found
+-- Found pybind11: /Users/leehyeonjong/radioconda/include (found version "2.11.1")
+-- Configuring done (0.6s)
+CMake Warning (dev):
+  Policy CMP0068 is not set: RPATH settings on macOS do not affect
+  install_name.  Run "cmake --help-policy CMP0068" for policy details.  Use
+  the cmake_policy command to set the policy and suppress this warning.
+
+  For compatibility with older versions of CMake, the install_name fields for
+  the following targets are still affected by RPATH settings:
+
+   gnuradio-customs
+
+This warning is for project developers.  Use -Wno-dev to suppress it.
+
+-- Generating done (0.0s)
+-- Build files have been written to: /Users/leehyeonjong/gr-customs/cmake-build-debug
