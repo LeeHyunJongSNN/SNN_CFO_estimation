@@ -52,7 +52,7 @@ while n <= numSamples
         
     if coarsePktOffset > rx_size - misalignedSize % Severely missaligned frame
         n = n + 1;
-        continue; % Frame detection failed. Go to next loop iteration
+        continue; % Frame is broken. Go to next loop iteration
     end
 
     % Extract L-STF and perform coarse frequency offset correction
