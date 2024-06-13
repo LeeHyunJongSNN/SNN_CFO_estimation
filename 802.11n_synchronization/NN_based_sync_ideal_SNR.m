@@ -18,7 +18,7 @@ tgnChannel.TransmitReceiveDistance = 10; % Distance in meters for NLOS
 tgnChannel.LargeScaleFadingEffect = 'None';
 tgnChannel.NormalizeChannelOutputs = false;
 
-% The number of packets
+% The number of signals
 transmitTime = 1000;
 
 % Set SNR
@@ -40,8 +40,6 @@ ind = wlanFieldIndices(cfgNHT);
 % Define error rates
 bitErrorRate = zeros(S, 1);
 frameErrorRate = zeros(S, 1);
-packetErrorRate = zeros(S, 1);
-
 
 % parfor i = 1:S % Use 'parfor' to speed up the simulation
 for i = 1:S % Use 'for' to debug the simulation
@@ -54,13 +52,12 @@ for i = 1:S % Use 'for' to debug the simulation
 
     % Account for noise energy in nulls so the SNR is defined per
     % active subcarrier
-    packetSNR = snr(i)-10*log10(ofdmInfo.FFTLength/ofdmInfo.NumTones);
+    frameSNR = snr(i)-10*log10(ofdmInfo.FFTLength/ofdmInfo.NumTones);
 
     % Loop to simulate multiple packets
-    numPacketErrors = 0;
     rateBitErrors = 0;
-    success = 0; % Succeed to receive a packet
-    n = 1; % Index of packet transmitted
+    frameSuccess = 0;
+    n = 1; % Index of signal transmitted
 
     whole_txPSDU = [];
     whole_rxPSDU = [];
@@ -78,14 +75,13 @@ for i = 1:S % Use 'for' to debug the simulation
         rx = tgnChannel(tx);
                 
         % Add noise
-        rx = awgn(rx,packetSNR);
+        rx = awgn(rx,frameSNR);
  
-        % Packet detect and determine coarse packet offset
+        % Frame detect and determine coarse frame offset
         coarsePktOffset = wlanPacketDetect(rx,cfgNHT.ChannelBandwidth);
-        if isempty(coarsePktOffset) % If empty no L-STF detected; bit and packet error
-            numPacketErrors = numPacketErrors+1;
-            n = n+1;
-            continue; % Go to next loop iteration
+        if isempty(coarsePktOffset) % If empty no L-STF detected
+            n = n + 1;
+            continue; % Frame detection failed. Go to next loop iteration
         end
         
         % Extract L-STF and perform coarse frequency offset correction
@@ -100,22 +96,21 @@ for i = 1:S % Use 'for' to debug the simulation
         nn_lstf = py.numpy.array(nn_lstf);
         coarseFreqOff = pyrunfile("cfo_estimate_scnn.py", "result", mat_input=nn_lstf);
         
-        rx = frequencyOffset(rx,fs,-coarseFreqOff);
+        rx = frequencyOffset(rx, fs, -coarseFreqOff);
         
-        % Extract the non-HT fields and determine fine packet offset
+        % Extract the non-HT fields and determine fine frame offset
         nonhtfields = rx(coarsePktOffset+(ind.LSTF(1):ind.LSIG(2)),:); 
         finePktOffset = wlanSymbolTimingEstimate(nonhtfields,...
             cfgNHT.ChannelBandwidth);
         
         % Determine final packet offset
-        pktOffset = coarsePktOffset+finePktOffset;
+        pktOffset = coarsePktOffset + finePktOffset;
 
-        % If packet detected outwith the range of expected delays from the
+        % If frame detected outwith the range of expected delays from the
         % channel modeling; packet error
-        if pktOffset>15
-            numPacketErrors = numPacketErrors+1;
+        if pktOffset > 15
             n = n + 1;
-            continue; % Go to next loop iteration
+            continue; % Packet error occurred. Go to next loop iteration.
         end
 
         % Extract L-LTF and perform fine frequency offset correction and
@@ -135,32 +130,26 @@ for i = 1:S % Use 'for' to debug the simulation
         % Recover the transmitted PSDU in HT Data
         rxPSDU = wlanNonHTDataRecover(nhtdata,chanEst,lltfNiose,cfgNHT);
         if ~isempty(rxPSDU)
-            success = success + 1;
+            frameSuccess = frameSuccess + 1;
+            whole_txPSDU = [whole_txPSDU; txPSDU];
+            whole_rxPSDU = [whole_rxPSDU; rxPSDU];
         end
 
-        % Determine if any bits are in error, i.e. bit error, frame error, 
-        % and packet error
+        % Determine if any bits are in error, i.e. bit error and frame error
         bitError = biterr(txPSDU, rxPSDU) / length(txPSDU);
         rateBitErrors = rateBitErrors + bitError;
-        packetError = any(biterr(txPSDU, rxPSDU));
-        numPacketErrors = numPacketErrors + packetError;
         n = n + 1;
-        
-        whole_txPSDU = [whole_txPSDU; txPSDU];
-        whole_rxPSDU = [whole_rxPSDU; rxPSDU];
 
     end
     
     % Calculate packet error rates (BER, FER, and PER) at SNR point
     
-    bitErrorRate(i) = rateBitErrors / success;
-    frameErrorRate(i) = sum(any(biterr(whole_txPSDU, whole_rxPSDU))) / success;
-    packetErrorRate(i) = numPacketErrors / (n - 1);
+    bitErrorRate(i) = rateBitErrors / frameSuccess;
+    frameErrorRate(i) = sum(any(biterr(whole_txPSDU, whole_rxPSDU))) / frameSuccess;
     disp(['SNR ' num2str(snr(i))...
           ' completed after '  num2str(n - 1) ' transmitted signals,'...
           ' BER: ' num2str(bitErrorRate(i)) ...
-          ' FER: ' num2str(frameErrorRate(i)) ...
-          ' PER: ' num2str(packetErrorRate(i))]);
+          ' FER: ' num2str(frameErrorRate(i))]);
 end
 
 figure;
@@ -176,10 +165,3 @@ grid on;
 xlabel('SNR [dB]');
 ylabel('FER');
 title('802.11n 10MHz NonHT, 1 Channel Model B-NLOS, Frame Error Rate');
-
-figure;
-semilogy(snr,packetErrorRate,'-ob');
-grid on;
-xlabel('SNR [dB]');
-ylabel('PER');
-title('802.11n 10MHz NonHT, 1 Channel Model B-NLOS, Packet Error Rate');
