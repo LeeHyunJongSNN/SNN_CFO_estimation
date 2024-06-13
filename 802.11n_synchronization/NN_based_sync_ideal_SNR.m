@@ -142,7 +142,7 @@ for i = 1:S % Use 'for' to debug the simulation
 
     end
     
-    % Calculate packet error rates (BER, FER, and PER) at SNR point
+    % Calculate packet error rates (BER and FER) at SNR point
     
     bitErrorRate(i) = rateBitErrors / frameSuccess;
     frameErrorRate(i) = sum(any(biterr(whole_txPSDU, whole_rxPSDU))) / frameSuccess;
