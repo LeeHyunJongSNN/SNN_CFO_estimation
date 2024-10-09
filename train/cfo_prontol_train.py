@@ -4,6 +4,7 @@ import numpy as np
 from scipy.signal import detrend
 
 import argparse
+import random
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,7 @@ import torch.optim as optim
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--batch_size", type=int, default=100)
+parser.add_argument("--input_size", type=int, default=160)
 parser.add_argument("--n_epochs", type=int, default=500)
 parser.add_argument("--learning_rate", type=float, default=0.001)
 parser.add_argument("--gpu", dest="gpu", action="store_true")
@@ -21,6 +23,7 @@ args = parser.parse_args()
 
 seed = args.seed
 batch_size = args.batch_size
+input_size = args.input_size
 n_epochs = args.n_epochs
 learning_rate = args.learning_rate
 gpu = args.gpu
@@ -62,9 +65,14 @@ raw_train = raw_train.astype(np.complex64)
 train_signals = []
 
 for line in raw_train:
-    line_data = line[0:160]
+    line_data = line[160-input_size:160]        # static
+    # input_size = random.randint(1, 5)  # random
+    # line_data = line[160 - 32 * input_size:160]
     line_label = np.real(line[-1])
     dcr = detrend(line_data - np.mean(line_data))
+    if input_size < 5:   # static -> 160, 2 / random -> 5, 64
+        dcr = np.concatenate((np.zeros(160-32*input_size).astype(np.complex64), dcr), axis=0)
+
     real = np.real(dcr).astype(np.float32)
     imag = np.imag(dcr).astype(np.float32)
     real_rms = np.sqrt(np.sum(np.power(np.abs(real), 2)) / 160)

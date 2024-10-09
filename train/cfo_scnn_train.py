@@ -2,22 +2,26 @@ import os
 import gc
 import numpy as np
 
-from spikingjelly.activation_based import surrogate, neuron, functional
+from spikingjelly.activation_based import functional
 
 from scipy.signal import detrend
 
 import argparse
+import random
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from SNN.CFO.scnn_networks import network_choose
+
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--batch_size", type=int, default=100)
+parser.add_argument("--input_size", type=int, default=160)
 parser.add_argument("--n_epochs", type=int, default=500)
-parser.add_argument("--n_steps", type=int, default=2)
-parser.add_argument("--learning_rate", type=float, default=0.0025)
+parser.add_argument("--network_type", type=str, default="TwoDCNN_FC1FC2")
+parser.add_argument("--learning_rate", type=float, default=0.0025)   # 0.0025
 parser.add_argument("--rate_decay", type=float, default=0.9)
 parser.add_argument("--gpu", dest="gpu", action="store_true")
 parser.add_argument("--spare_gpu", dest="spare_gpu", default=0)
@@ -26,8 +30,9 @@ args = parser.parse_args()
 
 seed = args.seed
 batch_size = args.batch_size
+input_size = args.input_size
 n_epochs = args.n_epochs
-n_steps = args.n_steps
+network_type = args.network_type
 rate_decay = args.rate_decay
 learning_rate = args.learning_rate
 gpu = args.gpu
@@ -69,9 +74,14 @@ raw_train = raw_train.astype(np.complex64)
 train_signals = []
 
 for line in raw_train:
-    line_data = line[0:160]
+    line_data = line[160-input_size:160]        # static
+    # input_size = random.randint(1, 5)  # random
+    # line_data = line[160 - 32 * input_size:160]
     line_label = np.real(line[-1])
     dcr = detrend(line_data - np.mean(line_data))
+    if input_size < 5:  # static -> 160, 2 / random -> 5, 64
+        dcr = np.concatenate((np.zeros(160 - 32 * input_size).astype(np.complex64), dcr), axis=0)
+
     real = np.real(dcr).astype(np.float32)
     imag = np.imag(dcr).astype(np.float32)
     whole = np.concatenate((real, imag), axis=0)
@@ -79,62 +89,45 @@ for line in raw_train:
 
 delta_freq = 49680
 train_x = torch.tensor(np.stack([i[0] for i in train_signals]), device=device)
-train_x = train_x.view(-1, 10, 32)
-train_y = torch.tensor(np.expand_dims(np.stack([i[1] for i in train_signals]), 1), device=device) / delta_freq
+if network_type.find("TwoDCNN") != -1:
+    train_x = train_x.view(120000, -1, 32)
+train_y = torch.tensor(np.expand_dims(np.stack([i[1] for i in train_signals]), axis=1), device=device) / delta_freq
 
 # dataloader
 train = torch.utils.data.TensorDataset(train_x, train_y)
 train_loader = torch.utils.data.DataLoader(train, batch_size=batch_size, shuffle=True, drop_last=True)
 
-# define model
-class Net(nn.Module):
-    def __init__(self):
-        super(Net, self).__init__()
-        functional.set_backend(self, backend='cupy')
-
-        self.conv = nn.Conv2d(1, 8, 3, padding=1, stride=1)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(640, 512)
-        self.if1 = neuron.IFNode(surrogate_function=surrogate.ATan())
-        self.fc2 = nn.Linear(512, 128)
-        self.fc3 = nn.Linear(128, 1)
-
-    def forward(self, x):
-        x = x.unsqueeze(1)
-        x = self.conv(x)
-        x = self.pool(x)
-
-        r = 0
-        for steps in range(n_steps):
-            nif = self.fc1(self.flatten(x))
-            nif = self.if1(nif)
-            r += nif
-
-        s = r / n_steps
-        x = self.fc2(s)
-        x = nn.functional.relu(x)
-        x = self.fc3(x)
-
-        return x
-
 # define loss and optimizer
-net = Net().to(device)
+net = network_choose(network_type)().to(device)
 loss_fn = nn.MSELoss()
-optimizer = optim.Adam(net.parameters(), lr=learning_rate)
+optimizer = optim.RAdam(net.parameters(), lr=learning_rate)
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=rate_decay)
 
 # train
 net.train()
+features = torch.tensor([], device=device)
 for epoch in range(n_epochs):
+
+    # Cut-out data augmentation
+    input_mask = torch.ones((batch_size, 1, 320), device=device)
+    input_size = torch.randint(1, 5, (100, 1), device=device)
+
+    for i in range(100):
+        # pos = torch.randint(1, 5, (1,), device=device)
+        pos = 0
+        # input_mask[i, :, 32 * pos - 32 * input_size[i]:32 * pos] = 0
+        input_mask[i, :, 32 * pos : 32 * pos + 32 * input_size[i]] = 0
+        # input_mask[i, :, 160 + 32 * pos - 32 * input_size[i]:160 + 32 * pos] = 0
+        input_mask[i, :, 160 + 32 * pos : 160 + 32 * pos + 32 * input_size[i]] = 0
+
     train_batch = iter(train_loader)
     for inputs, labels in train_batch:
         inputs, labels = inputs.to(device), labels.to(device)
+        inputs = inputs * input_mask.view(batch_size, -1, 32)
 
         optimizer.zero_grad()
-        loss = torch.sqrt(loss_fn(net(inputs), labels.float()) + 1e-6)
+        loss = torch.sqrt(loss_fn(net(inputs), labels.float()) + 1e-8)
         loss.backward()
-        nn.utils.clip_grad_norm_(net.parameters(), 5)
         optimizer.step()
         functional.reset_net(net)
 
@@ -142,4 +135,4 @@ for epoch in range(n_epochs):
         scheduler.step()
         print(f"Epoch: {epoch}, Loss: {loss.item()}")
 
-torch.save(net.state_dict(), "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/cfo_scnn_wireless.pth")
+torch.save(net.state_dict(), "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/scnn_models/" + network_type + ".pth")
