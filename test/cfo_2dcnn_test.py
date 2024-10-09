@@ -4,6 +4,7 @@ import numpy as np
 from scipy.signal import detrend
 
 import argparse
+import random
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ import torch.nn as nn
 parser = argparse.ArgumentParser()
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--batch_size", type=int, default=100)
+parser.add_argument("--input_size", type=int, default=64)
 parser.add_argument("--gpu", dest="gpu", action="store_true")
 parser.add_argument("--spare_gpu", dest="spare_gpu", default=0)
 parser.set_defaults(gpu=True)
@@ -18,6 +20,7 @@ args = parser.parse_args()
 
 seed = args.seed
 batch_size = args.batch_size
+input_size = args.input_size
 gpu = args.gpu
 spare_gpu = args.spare_gpu
 
@@ -42,7 +45,7 @@ else:
 torch.set_num_threads(os.cpu_count() - 1)
 
 fname_test = "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/"\
-        "WiFi_10MHz_Preambles_wireless_cfo_test_rician_-3dB.txt"
+        "WiFi_10MHz_Preambles_wireless_cfo_test_rician_0dB.txt"
 
 raw_test = np.loadtxt(fname_test, dtype='str', delimiter='\t')
 np.random.shuffle(raw_test)
@@ -56,16 +59,19 @@ raw_test = raw_test.astype(np.complex64)
 test_signals = []
 
 for line in raw_test:
-    line_data = line[0:160]
+    line_data = line[160 - input_size:160]
     line_label = np.real(line[-1])
     dcr = detrend(line_data - np.mean(line_data))
+    if input_size < 160:
+        dcr = np.concatenate((np.complex64(np.zeros(160 - input_size)), dcr), axis=0)
+
     real = np.real(dcr).astype(np.float32)
     imag = np.imag(dcr).astype(np.float32)
     whole = np.concatenate((real, imag), axis=0)
     test_signals.append((whole, float(line_label)))
 
 test_x = torch.tensor(np.stack([i[0] for i in test_signals]), device=device)
-test_x = test_x.view(-1, 10, 32)
+test_x = test_x.view(5000, -1, 32)
 test_y = torch.tensor(np.expand_dims(np.stack([i[1] for i in test_signals]), 1), device=device)
 
 # data loader
@@ -119,5 +125,48 @@ for inputs, labels in test_loader:
 # measurements
 test_outputs = np.array(test_outputs).squeeze().reshape(1, -1).squeeze()
 test_labels = np.array(test_labels).squeeze().reshape(1, -1).squeeze()
+
+test_outputs_1 = test_outputs[0:500]
+test_labels_1 = test_labels[0:500]
+test_outputs_2 = test_outputs[500:1000]
+test_labels_2 = test_labels[500:1000]
+test_outputs_3 = test_outputs[1000:1500]
+test_labels_3 = test_labels[1000:1500]
+test_outputs_4 = test_outputs[1500:2000]
+test_labels_4 = test_labels[1500:2000]
+test_outputs_5 = test_outputs[2000:2500]
+test_labels_5 = test_labels[2000:2500]
+test_outputs_6 = test_outputs[2500:3000]
+test_labels_6 = test_labels[2500:3000]
+test_outputs_7 = test_outputs[3000:3500]
+test_labels_7 = test_labels[3000:3500]
+test_outputs_8 = test_outputs[3500:4000]
+test_labels_8 = test_labels[3500:4000]
+test_outputs_9 = test_outputs[4000:4500]
+test_labels_9 = test_labels[4000:4500]
+test_outputs_10 = test_outputs[4500:5000]
+test_labels_10 = test_labels[4500:5000]
+
+mae_1 = MAE(test_outputs_1, test_labels_1)
+mae_2 = MAE(test_outputs_2, test_labels_2)
+mae_3 = MAE(test_outputs_3, test_labels_3)
+mae_4 = MAE(test_outputs_4, test_labels_4)
+mae_5 = MAE(test_outputs_5, test_labels_5)
+mae_6 = MAE(test_outputs_6, test_labels_6)
+mae_7 = MAE(test_outputs_7, test_labels_7)
+mae_8 = MAE(test_outputs_8, test_labels_8)
+mae_9 = MAE(test_outputs_9, test_labels_9)
+mae_10 = MAE(test_outputs_10, test_labels_10)
 mae = MAE(test_outputs, test_labels)
-print(f"MAE: {mae.item()}")
+
+print(f"MAE: {mae_1.item()}")
+print(f"MAE: {mae_2.item()}")
+print(f"MAE: {mae_3.item()}")
+print(f"MAE: {mae_4.item()}")
+print(f"MAE: {mae_5.item()}")
+print(f"MAE: {mae_6.item()}")
+print(f"MAE: {mae_7.item()}")
+print(f"MAE: {mae_8.item()}")
+print(f"MAE: {mae_9.item()}")
+print(f"MAE: {mae_10.item()}")
+print(f"Average MAE: {mae.item()}")
