@@ -4,23 +4,22 @@ import numpy as np
 from scipy.signal import detrend
 
 import argparse
-import random
 
 import torch
 import torch.nn as nn
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--batch_size", type=int, default=100)
-parser.add_argument("--input_size", type=int, default=64)
+parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--cutout", type=bool, default=True)
+parser.add_argument("--auto", type=bool, default=False)
+parser.add_argument("--num_lost", type=int, default=4) # if auto is False, 1 ~ 5
 parser.add_argument("--gpu", dest="gpu", action="store_true")
 parser.add_argument("--spare_gpu", dest="spare_gpu", default=0)
 parser.set_defaults(gpu=True)
 args = parser.parse_args()
 
-seed = args.seed
+seed = torch.initial_seed()
 batch_size = args.batch_size
-input_size = args.input_size
 gpu = args.gpu
 spare_gpu = args.spare_gpu
 
@@ -45,7 +44,7 @@ else:
 torch.set_num_threads(os.cpu_count() - 1)
 
 fname_test = "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/"\
-        "WiFi_10MHz_Preambles_wireless_cfo_test_rician_0dB.txt"
+        "WiFi_10MHz_Preambles_wireless_cfo_test_rician_18dB.txt"
 
 raw_test = np.loadtxt(fname_test, dtype='str', delimiter='\t')
 np.random.shuffle(raw_test)
@@ -59,20 +58,19 @@ raw_test = raw_test.astype(np.complex64)
 test_signals = []
 
 for line in raw_test:
-    line_data = line[160 - input_size:160]
+    line_data = line[0:160]
     line_label = np.real(line[-1])
     dcr = detrend(line_data - np.mean(line_data))
-    if input_size < 160:
-        dcr = np.concatenate((np.complex64(np.zeros(160 - input_size)), dcr), axis=0)
+    phase = np.angle(dcr).astype(np.float32)
 
-    real = np.real(dcr).astype(np.float32)
-    imag = np.imag(dcr).astype(np.float32)
-    whole = np.concatenate((real, imag), axis=0)
-    test_signals.append((whole, float(line_label)))
+    test_signals.append((phase, float(line_label)))
 
 test_x = torch.tensor(np.stack([i[0] for i in test_signals]), device=device)
-test_x = test_x.view(5000, -1, 32)
 test_y = torch.tensor(np.expand_dims(np.stack([i[1] for i in test_signals]), 1), device=device)
+
+# Obtain y_min and y_max from test labels (for denormalization)
+y_max = test_y.max().item()
+y_min = test_y.min().item()
 
 # data loader
 test = torch.utils.data.TensorDataset(test_x, test_y)
@@ -86,19 +84,21 @@ def MAE(y, y_hat):
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
-        self.conv = nn.Conv2d(1, 8, 3, padding=1, stride=1)
+        self.conv = nn.Conv2d(1, 16, 3, padding=1, stride=1)
+        self.batch_norm = nn.BatchNorm2d(16)
         self.pool = nn.MaxPool2d(2, 2)
-        self.batch_norm = nn.BatchNorm2d(8)
         self.flatten = nn.Flatten()
         self.fc1 = nn.Linear(640, 512)
-        self.fc2 = nn.Linear(512, 128)
-        self.fc3 = nn.Linear(128, 1)
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 1)
 
     def forward(self, x):
-        x = x.unsqueeze(1)
+        batch_size = x.shape[0]
+        x = x.view(batch_size, 1, 10, 16)
         x = self.conv(x)
-        x = self.pool(x)
         x = self.batch_norm(x)
+        x = nn.functional.relu(x)
+        x = self.pool(x)
         x = self.flatten(x)
         x = self.fc1(x)
         x = nn.functional.relu(x)
@@ -112,18 +112,30 @@ class Net(nn.Module):
 net = Net().to(device)
 
 # test
-net.load_state_dict(torch.load("/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/cfo_2dcnn_wireless.pth"))
+net.load_state_dict(torch.load("/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/incomplete/cfo_2dcnn_wireless.pth"))
 net.eval()
 test_outputs = []
 test_labels = []
 for inputs, labels in test_loader:
     inputs, labels = inputs.to(device), labels.to(device)
 
+    if args.cutout:
+        input_mask = torch.ones_like(inputs, device=device)
+        for i in range(inputs.size(0)):
+            if args.auto:
+                pos = torch.randint(1, 6, (1,), device=device).item()  # 1~5
+            else:
+                pos = args.num_lost
+
+            input_mask[i, :32 * (pos - 1)] = 0
+
+        inputs = inputs * input_mask
+
     test_outputs.append(net(inputs).cpu().detach().numpy())
     test_labels.append(labels.cpu().detach().numpy())
 
 # measurements
-test_outputs = np.array(test_outputs).squeeze().reshape(1, -1).squeeze()
+test_outputs = np.array(test_outputs).squeeze().reshape(1, -1).squeeze() * (y_max - y_min) + y_min
 test_labels = np.array(test_labels).squeeze().reshape(1, -1).squeeze()
 
 test_outputs_1 = test_outputs[0:500]

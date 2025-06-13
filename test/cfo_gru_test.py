@@ -61,9 +61,12 @@ for line in raw_test:
     line_data = line[0:160]
     line_label = np.real(line[-1])
     dcr = detrend(line_data - np.mean(line_data))
-    phase = np.angle(dcr).astype(np.float32)
+    real = np.real(dcr).astype(np.float32)
+    imag = np.imag(dcr).astype(np.float32)
 
-    test_signals.append((phase, float(line_label)))
+    whole = np.stack([real, imag], axis=0)
+
+    test_signals.append((whole, float(line_label)))
 
 test_x = torch.tensor(np.stack([i[0] for i in test_signals]), device=device)
 test_y = torch.tensor(np.expand_dims(np.stack([i[1] for i in test_signals]), 1), device=device)
@@ -82,37 +85,40 @@ def MAE(y, y_hat):
 
 # define model
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, hidden_size: int = 160, num_layers: int = 1, bidirectional: bool = False):
         super(Net, self).__init__()
-        self.conv = nn.Conv1d(1, 16, 3, padding=1, stride=1)
-        self.batch_norm = nn.BatchNorm1d(16)
-        self.pool = nn.MaxPool1d(2, 2)
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(1280, 512)
-        self.fc2 = nn.Linear(512, 256)
-        self.fc3 = nn.Linear(256, 1)
+        self.hidden_size   = hidden_size
+        self.num_layers    = num_layers
+        self.bidirectional = bidirectional
 
-    def forward(self, x):
-        batch_size = x.shape[0]
-        x = x.view(batch_size, 1, -1)
-        x = self.conv(x)
-        x = self.batch_norm(x)
-        x = nn.functional.relu(x)
-        x = self.pool(x)
-        x = self.flatten(x)
-        x = self.fc1(x)
-        x = nn.functional.relu(x)
-        x = self.fc2(x)
-        x = nn.functional.relu(x)
-        x = self.fc3(x)
+        self.gru = nn.GRU(
+            input_size     = 2,
+            hidden_size    = hidden_size,
+            num_layers     = num_layers,
+            batch_first    = True,
+            bidirectional  = bidirectional
+        )
 
-        return x
+        direction_factor = 2 if bidirectional else 1
+        self.fc1 = nn.Linear(hidden_size * direction_factor, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x):  # x: (B, 2, 160)
+        x = x.permute(0, 2, 1)  # (B, 160, 2)
+
+        gru_out, h_n = self.gru(x)
+        last_hidden = h_n[-1]  # (B, H)
+
+        out = self.fc1(last_hidden)
+        out = self.fc2(out)
+
+        return out
 
 # load model
 net = Net().to(device)
 
 # test
-net.load_state_dict(torch.load("/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/incomplete/cfo_1dcnn_wireless.pth"))
+net.load_state_dict(torch.load("/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/incomplete/cfo_gru_wireless.pth"))
 net.eval()
 test_outputs = []
 test_labels = []
@@ -120,6 +126,7 @@ for inputs, labels in test_loader:
     inputs, labels = inputs.to(device), labels.to(device)
 
     if args.cutout:
+        # inputs: [B, 2, 160]
         input_mask = torch.ones_like(inputs, device=device)
         for i in range(inputs.size(0)):
             if args.auto:
@@ -127,7 +134,7 @@ for inputs, labels in test_loader:
             else:
                 pos = args.num_lost
 
-            input_mask[i, :32 * (pos - 1)] = 0
+            input_mask[i, :, :32 * (pos - 1)] = 0
 
         inputs = inputs * input_mask
 
