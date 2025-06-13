@@ -4,30 +4,32 @@ import numpy as np
 from scipy.signal import detrend
 
 import argparse
-import random
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch_optimizer as torch_optim
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--seed", type=int, default=0)
-parser.add_argument("--batch_size", type=int, default=100)
-parser.add_argument("--input_size", type=int, default=160)
+parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--cutout", type=bool, default=True)
+parser.add_argument("--auto", type=bool, default=True)
+parser.add_argument("--num_lost", type=int, default=1) # if auto is False, 1 ~ 5
 parser.add_argument("--n_epochs", type=int, default=500)
 parser.add_argument("--learning_rate", type=float, default=0.001)
-parser.add_argument("--rate_decay", type=float, default=0.9)
+parser.add_argument("--schedular_patience", type=int, default=2)
+parser.add_argument("--gradient_max_norm", type=float, default=5.0)
+parser.add_argument('--early_stop', type=bool, default=True)
+parser.add_argument('--es_patience', type=int, default=10)
 parser.add_argument("--gpu", dest="gpu", action="store_true")
 parser.add_argument("--spare_gpu", dest="spare_gpu", default=0)
 parser.set_defaults(gpu=True)
 args = parser.parse_args()
 
-seed = args.seed
+seed = torch.initial_seed()
 batch_size = args.batch_size
-input_size = args.input_size
 n_epochs = args.n_epochs
 learning_rate = args.learning_rate
-rate_decay = args.rate_decay
 gpu = args.gpu
 spare_gpu = args.spare_gpu
 
@@ -52,8 +54,8 @@ else:
 torch.set_num_threads(os.cpu_count() - 1)
 
 # load data and change i to j (complex number)
-fname_train = "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/"\
-        "WiFi_10MHz_Preambles_wireless_cfo_train.txt"
+fname_train = "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/" \
+              "WiFi_10MHz_Preambles_wireless_cfo_train.txt"
 
 raw_train = np.loadtxt(fname_train, dtype='str', delimiter='\t')
 np.random.shuffle(raw_train)
@@ -65,37 +67,48 @@ raw_train = raw_train.astype(np.complex64)
 
 # removing DC offsets in signals
 train_signals = []
+test_signals = []
 
 for line in raw_train:
-    # line_data = line[160-input_size:160]        # static
-    input_size = random.randint(1, 5)  # random
-    line_data = line[160 - 32 * input_size:160]
+    line_data = line[0:160]
     line_label = np.real(line[-1])
     dcr = detrend(line_data - np.mean(line_data))
-    if input_size < 5:   # static -> 160, 2 / random -> 5, 64
-        dcr = np.concatenate((np.zeros(160-32*input_size).astype(np.complex64), dcr), axis=0)
+    phase = np.angle(dcr).astype(np.float32)
 
-    real = np.real(dcr).astype(np.float32)
-    imag = np.imag(dcr).astype(np.float32)
-    whole = np.concatenate((real, imag), axis=0)
-    train_signals.append((whole, float(line_label)))
+    train_signals.append((phase, float(line_label)))
 
-train_x = torch.tensor(np.stack([i[0] for i in train_signals]), device=device)
-train_y = torch.tensor(np.expand_dims(np.stack([i[1] for i in train_signals]), 1), device=device)
-train = torch.utils.data.TensorDataset(train_x, train_y)
-train_loader = torch.utils.data.DataLoader(train, batch_size=batch_size, shuffle=True, drop_last=True)
+# Apply min–max normalization to Y values
+all_y_np = np.stack([i[1] for i in train_signals])
+y_min = all_y_np.min()
+y_max = all_y_np.max()
+normalized_y = (all_y_np - y_min) / (y_max - y_min)
+
+# Create TensorDataset for training/validation
+all_x = torch.tensor(np.stack([i[0] for i in train_signals]), device=device)
+all_y = torch.tensor(np.expand_dims(normalized_y, axis=1), device=device, dtype=torch.float32)
+dataset = torch.utils.data.TensorDataset(all_x, all_y)
+dataset_size = len(dataset)
+
+# Split dataset into train (80%) and validation (20%)
+train_size = int(0.8 * dataset_size)
+val_size = dataset_size - train_size
+train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=False)
 
 # define model
 class Net(nn.Module):
     def __init__(self):
         super(Net, self).__init__()
 
-        self.fc1 = nn.Linear(320, 64)
+        self.fc1 = nn.Linear(160, 64)
         self.fc2 = nn.Linear(64, 128)
         self.fc3 = nn.Linear(128, 32)
         self.fc4 = nn.Linear(32, 1)
 
     def forward(self, x):
+        batch_size = x.size(0)
+        x = x.view(batch_size, -1)
         x = self.fc1(x)
         x = nn.functional.relu(x)
         x = self.fc2(x)
@@ -109,23 +122,94 @@ class Net(nn.Module):
 # define loss and optimizer
 net = Net().to(device)
 loss_fn = nn.MSELoss()
-optimizer = optim.Adam(net.parameters(), lr=learning_rate)
-scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=rate_decay)
+optimizer = torch_optim.Lookahead(optim.RAdam(net.parameters(), lr=learning_rate))
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
+                                                 patience=args.schedular_patience)
 
 # train
-net.train()
+best_val_loss = float('inf')
+epochs_no_improve = 0
+best_model_state = None
+
+# Training loop with validation (80:20 split)
 for epoch in range(n_epochs):
-    train_batch = iter(train_loader)
-    for inputs, labels in train_batch:
+    net.train()
+    train_losses = []
+    for inputs, labels in train_loader:
         inputs, labels = inputs.to(device), labels.to(device)
 
+        if args.cutout:
+            input_mask = torch.ones_like(inputs, device=device)
+            for i in range(inputs.size(0)):
+                if args.auto:
+                    pos = torch.randint(1, 6, (1,), device=device).item()  # 1~5
+                else:
+                    pos = args.num_lost
+
+                input_mask[i, :32 * (pos - 1)] = 0
+
+            inputs = inputs * input_mask
+
         optimizer.zero_grad()
-        loss = torch.sqrt(loss_fn(net(inputs), labels.float()) + 1e-6)
+
+        outputs = net(inputs)
+
+        loss = torch.sqrt(loss_fn(outputs, labels.float()) + 1e-8)
         loss.backward()
+
+        nn.utils.clip_grad_norm_(net.parameters(), max_norm=args.gradient_max_norm)
         optimizer.step()
+        train_losses.append(loss.item())
 
-    if epoch % 10 == 0:
-        scheduler.step()
-        print(f"Epoch: {epoch}, Loss: {loss.item()}")
+    avg_train_loss = sum(train_losses) / len(train_losses)
 
-torch.save(net.state_dict(), "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/cfo_dnn_wireless.pth")
+    # Validation phase
+    net.eval()
+    val_losses = []
+    val_mae = []
+    with torch.no_grad():
+        for inputs, labels in val_loader:
+            inputs, labels = inputs.to(device), labels.to(device)
+
+            if args.cutout:
+                input_mask = torch.ones_like(inputs, device=device)
+                for i in range(inputs.size(0)):
+                    if args.auto:
+                        pos = torch.randint(1, 6, (1,), device=device).item()  # 1~5
+                    else:
+                        pos = args.num_lost
+
+                    input_mask[i, :32 * (pos - 1)] = 0
+
+                inputs = inputs * input_mask
+
+            outputs = net(inputs)
+            loss_val = torch.sqrt(loss_fn(outputs, labels.float()) + 1e-8)
+            mae_val = torch.mean(torch.abs(outputs - labels))
+            val_losses.append(loss_val.item())
+            val_mae.append(mae_val.item())
+
+    avg_val_loss = sum(val_losses) / len(val_losses)
+    avg_val_mae = sum(val_mae) / len(val_mae)
+    denorm_val_mae = avg_val_mae * (y_max - y_min)
+    scheduler.step(avg_val_loss)
+
+    print(f"Epoch {epoch+1}/{n_epochs} - Val RMSE: {avg_val_loss:.4f}, Val MAE (denorm): {denorm_val_mae:.4f}")
+
+    # Early stopping
+    if args.early_stop:
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            epochs_no_improve = 0
+            best_model_state = net.state_dict()
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= args.es_patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                net.load_state_dict(best_model_state)
+                torch.save(net.state_dict(),
+                           "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/incomplete/cfo_dnn_wireless.pth")
+
+                break
+
+# torch.save(net.state_dict(), "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/incomplete/cfo_dnn_wireless.pth")
