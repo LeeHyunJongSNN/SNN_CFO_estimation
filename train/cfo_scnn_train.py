@@ -1,5 +1,6 @@
 import os
 import gc
+import re
 import numpy as np
 from scipy.signal import detrend
 import argparse
@@ -21,11 +22,13 @@ parser.add_argument("--conv_channels", type=int, default=[64, 64])
 parser.add_argument("--linear_dims", type=int, default=[64, 32, 32])
 parser.add_argument("--num_blocks_1", type=int, default=2)
 parser.add_argument("--num_blocks_2", type=int, default=2)
-parser.add_argument("--beta", type=float, default=0.5)
-parser.add_argument("--gamma", type=float, default=0.5)
+parser.add_argument("--alpha", type=float, default=1.0)  # 1.0
+parser.add_argument("--beta", type=float, default=0.5)   # 0.5
+parser.add_argument("--gamma", type=float, default=0.5)  # 0.5
+parser.add_argument("--delta", type=float, default=0.1)  # 0.1
 parser.add_argument("--eta", type=float, default=2.0)
+parser.add_argument("--epsilon", type=float, default=0.1)
 parser.add_argument("--temp", type=float, default=3.0)
-parser.add_argument("--lambda_route", type=float, default=0.1)
 parser.add_argument("--learning_rate", type=float, default=0.005)
 parser.add_argument("--schedular_patience", type=int, default=2)
 parser.add_argument("--gradient_max_norm", type=float, default=5.0)
@@ -137,6 +140,27 @@ def anneal_and_clamp_tau(model, sched_tau, tau_max=None):
             else:
                 m.tau.data.clamp_(min=sched_tau, max=tau_max)
 
+# ───────── Energy constants (pJ) ─────────
+E_MAC = 3.1        # Multiply
+E_AC  = 0.1        # Accumulate
+
+# SNN sparsity 평균값
+T_STEPS        = 2        # simulation timesteps
+SPIKE_RATE_AVG = 0.18     # 평균 spike rate
+
+# ───────── pJ-리스트용 에너지 계산 함수 ─────────
+def compute_expected_energy_precalc(gate_logits, energy_costs_pJ, tau=1.0):
+    """
+    energy_costs_pJ : 이미 pJ 단위로 계산된 [K] 리스트
+    gate_logits     : (B, K)
+    반환값           : 배치 평균 에너지 (J 단위)
+    """
+    import torch.nn.functional as F  # 로컬 import
+    probs = F.gumbel_softmax(gate_logits, tau=tau, hard=False)  # (B,K)
+    e_pJ  = gate_logits.new_tensor(energy_costs_pJ)             # (K)
+
+    return (probs * e_pJ).sum(dim=1).mean() * 1e-12             # → J
+
 class DSConv1d(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=False):
         super(DSConv1d, self).__init__()
@@ -232,15 +256,14 @@ class DSConv2dSE(nn.Module):
             padding=padding, groups=in_channels, bias=bias)
 
         # pointwise: 1×1 conv
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
-
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1)
         self.bn   = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=False)
         self.se   = SEBlock2d(out_channels, reduction)
 
     def forward(self, x):
         out = self.depthwise(x)
-        out = self.pointwise(out)
+        out = self.pointwise(out)  # (B, Cout, H, W)
         out = self.bn(out)
         out = self.relu(out)
         out = self.se(out)
@@ -313,6 +336,8 @@ class SlimmableDSConv2dSE(nn.Module):
 
         # learned 1×1 up-projection  (초깃값은 identity, 훈련 중 fine-tune)
         out = self.up(out)
+
+        self.last_width_logits = logits
 
         return out
 
@@ -394,6 +419,8 @@ class LinearBlockWithDynamicGate(nn.Module):
         for sel, out_k in zip(sel_list, out_k_list):
             out[sel] = out_k
 
+        self.last_expert_logits = logits
+
         return out
 
 class ConvMicroBlock(nn.Module):
@@ -463,7 +490,7 @@ class Net(nn.Module):
             if i == 0:
                 self.conv_blocks.append(ConvMicroBlock(in_c, out_c))
             else:
-                self.conv_blocks.append(ConvMicroBlock(in_c, out_c))
+                self.conv_blocks.append(SlimmableConvMicroBlock(in_c, out_c))
             in_c = out_c
 
         # Gate가 첫 블록의 GAP vector를 보니까 ↓
@@ -522,7 +549,14 @@ class Net(nn.Module):
 
         y_final = self.fc_pred(out_lin)
 
-        return y_final, y_exit1, depth_l, y_stack, x1, out_lin, gate_logits   # depth_c 미사용이면 None
+        # width logits: conv_blocks[1:] 에만 있음
+        width_logits = [blk.core[0].last_width_logits for blk in self.conv_blocks[1:]]
+
+        # expert logits: 모든 linear_blocks
+        expert_logits = [lb.last_expert_logits for lb in self.linear_blocks]
+
+        return y_final, y_exit1, depth_l, y_stack, x1, out_lin, gate_logits, \
+            width_logits, expert_logits # depth_c 미사용이면 None
 
 tau0, tau_min, tau_gamma = 5.0, 0.3, 0.96
 
@@ -559,6 +593,127 @@ def gradnorm_update(losses, params, eta=1.5):
 
     return ws
 
+def compute_layer_ops(model: nn.Module, input_size: tuple):
+    """
+    Automatically computes the number of operations (MACs) per layer using formulas from the paper:
+    - Conv2d: OPS = Cin * Cout * kH * kW * Hout * Wout
+    - Linear: OPS = in_features * out_features
+
+    model: Your PyTorch nn.Module
+    input_size: Tuple specifying (batch_size, channels, height, width) for an example input
+
+    Returns a dict mapping layer names to their OPS count.
+    """
+    ops = {}
+    hooks = []
+
+    def conv_hook(self, input, output):
+        Cin = input[0].shape[1]
+        Cout = output.shape[1]
+        Hout, Wout = output.shape[2], output.shape[3]
+        kH, kW = self.kernel_size
+        layer_ops = Cin * Cout * kH * kW * Hout * Wout
+        ops[self] = layer_ops
+
+    def linear_hook(self, input, output):
+        Cin = input[0].shape[1]
+        Cout = output.shape[1]
+        layer_ops = Cin * Cout
+        ops[self] = layer_ops
+
+    # Register hooks on each Conv2d and Linear
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Conv2d):
+            hooks.append((name, module.register_forward_hook(conv_hook)))
+        elif isinstance(module, nn.Linear):
+            hooks.append((name, module.register_forward_hook(linear_hook)))
+
+    # Run a forward pass with dummy input
+    model.eval()
+    with torch.no_grad():
+        model(torch.randn(input_size, device=next(model.parameters()).device))
+
+    # Clean up hooks and build result dict
+    result = {}
+    for name, hook in hooks:
+        module = dict(model.named_modules())[name]
+        result[name] = ops.get(module, 0)
+        hook.remove()
+
+    return result
+
+def build_gate_ops_tables(net, layer_ops):
+    """
+    layer_ops : compute_layer_ops() 로 얻은 {모듈경로: MACs} 딕셔너리
+    net       : 학습에 사용할 모델
+    반환값     : {
+        "width_ops" : [MACs_per_width],
+        "expert_ops_list" : [[blk0_e0, …],  [blk1_e0, …],  …],
+        "depth_ops" : [MACs_depth1, MACs_depth2, …],
+    }
+    ------------------------------------------------------------------
+    * 폭(width)  : conv_blocks[1:], pointwise 레이어 기준
+    * 익스퍼트   : 각 LinearBlock 안의 dnn_experts.*, snn_experts.* 중
+                  “*.0” (Linear/Conv 본체) 만 집계
+    * 깊이(depth): early-exit 레벨별 누적 MACs (예시는 exit1 / full)
+    """
+
+    # ========== ① WIDTH 게이트 ==========
+    width_ops = []
+    for idx, blk in enumerate(net.conv_blocks[1:], start=1):  # conv_blocks[1:] 만 dynamic
+        # 해당 블록의 pointwise 레이어 이름을 찾아 layer_ops에서 MACs 추출
+        pattern = fr"conv_blocks\.{idx}\.core\.0\.pointwise"
+        macs = next(m for n, m in layer_ops.items() if re.fullmatch(pattern, n))
+        # 폭 게이트는 ratio(0.25/0.5/…)대로 채널 수만 달라지므로
+        # base MACs × ratio 로 간단히 추정
+        ratios = (0.25, 0.5, 0.75, 1.0)
+        width_ops = [int(macs * r) for r in ratios]
+        break  # 모두 동일 base라 한 번만 계산
+
+    # ========== ② EXPERT 게이트 ==========
+    expert_ops_list = []
+    for i, lb in enumerate(net.linear_blocks):
+        # dnn_experts.*.0     또는 snn_experts.*.0  만 집계
+        pat = fr"linear_blocks\.{i}\.(dnn_experts|snn_experts)\.\d+\.0$"
+        ops_this_blk = [
+            macs for name, macs in layer_ops.items()
+            if re.fullmatch(pat, name)
+        ]
+        expert_ops_list.append(sorted(ops_this_blk))  # K_i 길이 = 해당 블록 전문가 수
+
+    # ========== ③ DEPTH 게이트 ==========
+    #  예시 : exit1 = 폭블록[1] + expert블록[0]
+    #         exit2 = 전체 네트(=full)   ← 수정 가능
+    depth1_macs = 0
+    #  conv_blocks[1] 전체 MAC 합산
+    for name, macs in layer_ops.items():
+        if name.startswith("conv_blocks.1."):
+            depth1_macs += macs
+    #  linear_blocks.0.* 전체 MAC 합산
+    for name, macs in layer_ops.items():
+        if name.startswith("linear_blocks.0."):
+            depth1_macs += macs
+
+    # full 모델 MACs
+    full_macs = sum(layer_ops.values())
+    depth_ops = [depth1_macs, full_macs]
+
+    return {
+        "width_ops": width_ops,
+        "expert_ops_list": expert_ops_list,
+        "depth_ops": depth_ops,
+    }
+
+def compute_expected_energy(gate_logits, ops_MACs, E_MAC=E_MAC, E_AC=E_AC, tau=1.0):
+    # Gumbel-Softmax로 soft 확률
+    probs = F.gumbel_softmax(gate_logits, tau=tau, hard=False)   # [B, K]
+    energy_costs = gate_logits.new_tensor(ops_MACs) * (E_MAC + E_AC)  # [K] * pJ
+    #   MACs ≈ ACs 라서  (MAC+AC) × pJ  로 단순화
+    #   더 정밀하게 하려면   MACs*E_MAC + MACs*E_AC  따로 계산해도 OK
+    E_batch_pJ = (probs * energy_costs).sum(dim=1).mean()        # scalar (pJ)
+
+    return E_batch_pJ * 1e-12
+
 if __name__ == "__main__":
     # Define loss and optimizer
     net = Net().to(device)
@@ -566,6 +721,28 @@ if __name__ == "__main__":
     optimizer = torch_optim.Lookahead(optim.RAdam(net.parameters(), lr=learning_rate))
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
                                                      patience=args.schedular_patience)
+
+    layer_ops = compute_layer_ops(net, input_size=(1, 2, 16, 10))
+
+    expert_names = []
+    for i, _ in enumerate(net.linear_blocks):
+        pat = fr"linear_blocks\.{i}\.(dnn_experts|snn_experts)\.\d+\.0$"
+        expert_names += [n for n in layer_ops if re.fullmatch(pat, n)]
+
+    expert_energy_pJ = []
+    for n in expert_names:
+        macs = layer_ops[n]  # Conv/Linear → AC ≃ MAC
+        if "snn_experts" in n:  # ▸ SNN  : AC만 × sparsity
+            cost = macs * E_AC * SPIKE_RATE_AVG * T_STEPS
+        else:  # ▸ DNN  : MAC+AC
+            cost = macs * (E_MAC + E_AC)  # = macs × 3.2 pJ
+        expert_energy_pJ.append(cost)
+
+    gate_ops = build_gate_ops_tables(net, layer_ops)
+
+    width_ops_MACs = gate_ops["width_ops"]  # [K_w]
+    expert_ops_list = gate_ops["expert_ops_list"]  # [[K_e0], [K_e1], …]
+    depth_ops_MACs = gate_ops["depth_ops"]  # [K_d]
 
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -593,7 +770,32 @@ if __name__ == "__main__":
 
             optimizer.zero_grad()
 
-            y_final, y_exit1, depth, y_stack, f_exit, f_final, gate_logits = net(inputs)
+            y_final, y_exit1, depth, y_stack, f_exit, f_final, gate_logits, width_logits, expert_logits = net(inputs)
+
+            # Compute expected energy cost
+            # ----- 폭 게이트 -----
+            E_width_J = torch.stack([
+                compute_expected_energy(logit,
+                                        width_ops_MACs,  # 길이 K_w
+                                        tau=blk.core[0].tau.item())
+                for logit, blk in zip(width_logits, net.conv_blocks[1:])
+            ]).sum()
+
+            # ----- 익스퍼트 게이트 -----
+            E_expert_J = torch.stack([
+                compute_expected_energy_precalc(
+                    logit,
+                    expert_energy_pJ,  # ← 위에서 만든 pJ 리스트
+                    tau=lb.tau.item())
+                for logit, lb in zip(expert_logits, net.linear_blocks)
+            ]).sum()
+
+            # ----- 깊이 게이트 -----
+            E_depth_J = compute_expected_energy(gate_logits,
+                                                depth_ops_MACs,  # 길이 K_d
+                                                tau=net.depth_gate.tau.item())
+
+            E_total_J = E_width_J + E_expert_J + E_depth_J
 
             # ── (1) Main & Aux RMSE ─────────────────
             L_main = torch.sqrt(loss_fn(y_final, labels) + 1e-8)
@@ -615,11 +817,12 @@ if __name__ == "__main__":
             loss_list = [L_aux, KD, L_feat]
             weight_vec = gradnorm_update(loss_list, net.parameters(), eta=args.eta)
             alpha, beta, gamma = weight_vec  # replace args.*
+            # alpha, beta, gamma = 1.0, 1.0, 1.0
 
             routing_label = torch.argmin(L_each, dim=1)
             routing_ce = F.cross_entropy(gate_logits, routing_label)
 
-            loss = L_main + alpha * L_aux + beta * KD + gamma * L_feat + args.lambda_route * routing_ce
+            loss = L_main + alpha * L_aux + beta * KD + gamma * L_feat + args.delta * routing_ce + args.epsilon * E_total_J
 
             loss.backward()
 
@@ -679,7 +882,7 @@ if __name__ == "__main__":
                 if epochs_no_improve >= args.es_patience:
                     print(f"Early stopping triggered at epoch {epoch+1}")
                     net.load_state_dict(best_model_state)
-                    torch.save(net, "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/ablation/complete/cfo_scnn_wireless_ee.pt")
+                    torch.save(net, "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/complete/cfo_scnn_wireless.pt")
                     break
 
     # torch.save(net, "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/cfo_scnn_wireless.pt")
