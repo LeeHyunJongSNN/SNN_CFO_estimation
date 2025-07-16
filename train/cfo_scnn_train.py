@@ -15,7 +15,7 @@ from spikingjelly.activation_based import neuron, functional, surrogate
 parser = argparse.ArgumentParser()
 parser.add_argument("--batch_size", type=int, default=128)
 parser.add_argument("--n_epochs", type=int, default=500)
-parser.add_argument("--cutout", type=bool, default=False)
+parser.add_argument("--cutout", type=bool, default=True)
 parser.add_argument("--auto", type=bool, default=True)
 parser.add_argument("--num_lost", type=int, default=1) # if auto is False, 1 ~ 5
 parser.add_argument("--conv_channels", type=int, default=[64, 64])
@@ -27,7 +27,7 @@ parser.add_argument("--beta", type=float, default=0.5)   # 0.5
 parser.add_argument("--gamma", type=float, default=0.5)  # 0.5
 parser.add_argument("--delta", type=float, default=0.1)  # 0.1
 parser.add_argument("--eta", type=float, default=2.0)
-parser.add_argument("--epsilon", type=float, default=0.1)
+parser.add_argument("--epsilon", type=float, default=0.01)
 parser.add_argument("--temp", type=float, default=3.0)
 parser.add_argument("--learning_rate", type=float, default=0.005)
 parser.add_argument("--schedular_patience", type=int, default=2)
@@ -724,19 +724,23 @@ if __name__ == "__main__":
 
     layer_ops = compute_layer_ops(net, input_size=(1, 2, 16, 10))
 
-    expert_names = []
+    expert_energy_pJ_list = []  # ← 리스트의 리스트!
+
     for i, _ in enumerate(net.linear_blocks):
         pat = fr"linear_blocks\.{i}\.(dnn_experts|snn_experts)\.\d+\.0$"
-        expert_names += [n for n in layer_ops if re.fullmatch(pat, n)]
+        names_i = [n for n in layer_ops if re.fullmatch(pat, n)]
 
-    expert_energy_pJ = []
-    for n in expert_names:
-        macs = layer_ops[n]  # Conv/Linear → AC ≃ MAC
-        if "snn_experts" in n:  # ▸ SNN  : AC만 × sparsity
-            cost = macs * E_AC * SPIKE_RATE_AVG * T_STEPS
-        else:  # ▸ DNN  : MAC+AC
-            cost = macs * (E_MAC + E_AC)  # = macs × 3.2 pJ
-        expert_energy_pJ.append(cost)
+        costs_i = []
+        for n in names_i:
+            macs = layer_ops[n]  # AC ≃ MAC
+            if "snn_experts" in n:  # ▸ SNN
+                cost = macs * E_AC * SPIKE_RATE_AVG * T_STEPS
+            else:  # ▸ DNN
+                cost = macs * (E_MAC + E_AC)  # 3.2 pJ × MAC
+            costs_i.append(cost)
+
+        # ↳ 반드시 logits 열 수와 같은 길이가 됨
+        expert_energy_pJ_list.append(costs_i)
 
     gate_ops = build_gate_ops_tables(net, layer_ops)
 
@@ -785,9 +789,9 @@ if __name__ == "__main__":
             E_expert_J = torch.stack([
                 compute_expected_energy_precalc(
                     logit,
-                    expert_energy_pJ,  # ← 위에서 만든 pJ 리스트
+                    expert_energy_pJ_list[i],  # ← 블록별 리스트!
                     tau=lb.tau.item())
-                for logit, lb in zip(expert_logits, net.linear_blocks)
+                for i, (logit, lb) in enumerate(zip(expert_logits, net.linear_blocks))
             ]).sum()
 
             # ----- 깊이 게이트 -----
@@ -882,7 +886,7 @@ if __name__ == "__main__":
                 if epochs_no_improve >= args.es_patience:
                     print(f"Early stopping triggered at epoch {epoch+1}")
                     net.load_state_dict(best_model_state)
-                    torch.save(net, "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/complete/cfo_scnn_wireless.pt")
+                    torch.save(net, "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/ablation/incomplete/cfo_scnn_wireless_eps(0.5).pt")
                     break
 
     # torch.save(net, "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/cfo_scnn_wireless.pt")
