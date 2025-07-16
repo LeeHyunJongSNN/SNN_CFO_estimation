@@ -50,7 +50,7 @@ sys.modules["__main__"] = cfo_scnn_train
 
 # Load test dataset from file
 fname_test = ("/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/"
-              "WiFi_10MHz_Preambles_wireless_cfo_test_-3dB.txt")
+              "WiFi_10MHz_Preambles_wireless_cfo_test_18dB.txt")
 
 raw_test = np.loadtxt(fname_test, dtype='str', delimiter='\t')
 np.random.shuffle(raw_test)
