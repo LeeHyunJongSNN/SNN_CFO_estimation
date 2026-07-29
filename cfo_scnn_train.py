@@ -1,892 +1,1292 @@
-import os
+"""Train the SDyNN CFO estimator.
+
+This revision synchronizes the implementation with the manuscript in four
+important places:
+  1. convolutional early exit is part of the actual forward path;
+  2. Gumbel-Softmax is used only during training, while evaluation uses a
+     deterministic argmax;
+  3. both SNN and DNN experts are evaluated during training to construct the
+     minimum-error routing label (class 0=SNN, class 1=DNN);
+  4. operation/FLOP accounting is analytical, group-aware, and includes the
+     functional slimmable pointwise convolution and routing overhead.
+
+The checkpoint format is state-dict based. Models trained with the older code
+must be retrained because the old implementation did not execute Conv-EE and
+did not train the MoE gate with minimum-error expert labels.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
 import gc
-import re
+import math
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
+
 import numpy as np
 from scipy.signal import detrend
-import argparse
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-import torch_optimizer as torch_optim
-from spikingjelly.activation_based import neuron, functional, surrogate
+import torch.optim as optim
+from spikingjelly.activation_based import functional, neuron, surrogate
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", type=int, default=128)
-parser.add_argument("--n_epochs", type=int, default=500)
-parser.add_argument("--cutout", type=bool, default=True)
-parser.add_argument("--auto", type=bool, default=True)
-parser.add_argument("--num_lost", type=int, default=1) # if auto is False, 1 ~ 5
-parser.add_argument("--conv_channels", type=int, default=[64, 64])
-parser.add_argument("--linear_dims", type=int, default=[64, 32, 32])
-parser.add_argument("--num_blocks_1", type=int, default=2)
-parser.add_argument("--num_blocks_2", type=int, default=2)
-parser.add_argument("--alpha", type=float, default=1.0)  # 1.0
-parser.add_argument("--beta", type=float, default=0.5)   # 0.5
-parser.add_argument("--gamma", type=float, default=0.5)  # 0.5
-parser.add_argument("--delta", type=float, default=0.1)  # 0.1
-parser.add_argument("--eta", type=float, default=2.0)
-parser.add_argument("--epsilon", type=float, default=0.01)
-parser.add_argument("--temp", type=float, default=3.0)
-parser.add_argument("--learning_rate", type=float, default=0.005)
-parser.add_argument("--schedular_patience", type=int, default=2)
-parser.add_argument("--gradient_max_norm", type=float, default=5.0)
-parser.add_argument('--early_stop', type=bool, default=True)
-parser.add_argument('--es_patience', type=int, default=10)
-parser.add_argument("--num_steps", type=int, default=2)
-parser.add_argument("--gpu", dest="gpu", action="store_true")
-parser.add_argument("--spare_gpu", dest="spare_gpu", default=0)
-parser.set_defaults(gpu=True)
-args = parser.parse_args()
 
-seed = torch.initial_seed()
-batch_size = args.batch_size
-n_epochs = args.n_epochs
-learning_rate = args.learning_rate
-gpu = args.gpu
-spare_gpu = args.spare_gpu
+# ---------------------------------------------------------------------------
+# Defaults and physical constants
+# ---------------------------------------------------------------------------
+DEFAULT_CONV_CHANNELS: Tuple[int, int] = (64, 64)
+DEFAULT_LINEAR_DIMS: Tuple[int, int, int] = (64, 32, 32)
+DEFAULT_WIDTHS: Tuple[float, ...] = (0.25, 0.5, 0.75, 1.0)
+INPUT_SHAPE: Tuple[int, int, int] = (2, 10, 16)
+INPUT_IQ_SAMPLES = 160
 
-# Set up GPU usage
-gc.collect()
-torch.cuda.empty_cache()
-if spare_gpu != 0:
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(spare_gpu)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+E_MAC_PJ = 3.1   # multiplication energy used by the manuscript
+E_AC_PJ = 0.1    # accumulation energy used by the manuscript
+SPIKE_RATE_AVG = 0.18
+CHECKPOINT_VERSION = 2
 
-if gpu and torch.cuda.is_available():
-    torch.cuda.manual_seed_all(seed)
-else:
+
+def str2bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid Boolean value: {value!r}")
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--n_epochs", type=int, default=500)
+    parser.add_argument("--cutout", type=str2bool, default=False)
+    parser.add_argument("--auto", type=str2bool, default=False)
+    parser.add_argument("--num_lost", type=int, default=1)  # 1 ~ 5
+    parser.add_argument("--conv_channels", type=int, nargs="+", default=list(DEFAULT_CONV_CHANNELS))
+    parser.add_argument("--linear_dims", type=int, nargs="+", default=list(DEFAULT_LINEAR_DIMS))
+    parser.add_argument("--num_blocks_1", type=int, default=2)
+    parser.add_argument("--num_blocks_2", type=int, default=2)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--beta", type=float, default=0.5)
+    parser.add_argument("--gamma", type=float, default=0.5)
+    parser.add_argument("--delta", type=float, default=0.1)
+    parser.add_argument("--eta", type=float, default=2.0)
+    parser.add_argument("--epsilon", type=float, default=0.01)
+    parser.add_argument("--learning_rate", type=float, default=0.005)
+    parser.add_argument("--schedular_patience", type=int, default=2)
+    parser.add_argument("--gradient_max_norm", type=float, default=5.0)
+    parser.add_argument("--early_stop", type=str2bool, default=True)
+    parser.add_argument("--es_patience", type=int, default=10)
+    parser.add_argument("--num_steps", type=int, default=2)
+    parser.add_argument("--gpu", type=str2bool, default=True)
+    parser.add_argument("--spare_gpu", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--train_file",
+        type=str,
+        default=(
+            "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/802.11ax_synth_changing/"
+            "WiFi_20MHz_L-STF_ax_cfo_rapid_train.txt"
+        ),
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=(
+            "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/complete/"
+            "cfo_scnn_wireless_ax_changing.pt"
+        ),
+    )
+    return parser
+
+
+def configure_device(gpu: bool, spare_gpu: int, seed: int) -> torch.device:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if spare_gpu != 0:
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(spare_gpu)
+
+    use_cuda = gpu and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
     torch.manual_seed(seed)
-    device = "cpu"
-    if gpu:
-        gpu = False
+    np.random.seed(seed)
+    if use_cuda:
+        torch.cuda.manual_seed_all(seed)
+    cpu_count = os.cpu_count() or 1
+    torch.set_num_threads(max(1, cpu_count - 1))
+    return device
 
-torch.set_num_threads(os.cpu_count() - 1)
 
-# Load training/validation data from file
-fname_train = "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/WiFi_10MHz_Preambles_wireless_cfo_train.txt"
-raw_train = np.loadtxt(fname_train, dtype='str', delimiter='\t')
-np.random.shuffle(raw_train)
-for i in range(len(raw_train)):
-    for j in range(len(raw_train[i])):
-        raw_train[i][j] = raw_train[i][j].replace('i', 'j')
-raw_train = raw_train.astype(np.complex64)
+# ---------------------------------------------------------------------------
+# Routing helpers
+# ---------------------------------------------------------------------------
+def _select_gate(
+    logits: torch.Tensor,
+    tau: torch.Tensor | float,
+    training: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return one-hot gate and class indices.
 
-# Remove DC offsets and prepare training signals
-train_signals = []
-for line in raw_train:
-    # Extract the last 'input_size' samples from the full preamble
-    line_data = line[0:160]
-    line_label = np.real(line[-1])
-    dcr = detrend(line_data - np.mean(line_data))
-    real = np.real(dcr).astype(np.float32)
-    imag = np.imag(dcr).astype(np.float32)
-    real_rms = np.sqrt(np.sum(np.power(np.abs(real), 2)) / 160)
-    imag_rms = np.sqrt(np.sum(np.power(np.abs(imag), 2)) / 160)
-
-    # Concatenate into flat 320-dim vector (first 160: real, next 160: imag)
-    # whole = np.stack([real, imag], axis=0)
-    whole = np.stack([real / real_rms, imag / imag_rms], axis=0)
-    train_signals.append((whole, float(line_label)))
-
-# Apply min–max normalization to Y values
-all_y_np = np.stack([i[1] for i in train_signals])
-y_min = all_y_np.min()
-y_max = all_y_np.max()
-normalized_y = (all_y_np - y_min) / (y_max - y_min)
-
-# Create TensorDataset for training/validation
-all_x = torch.tensor(np.stack([i[0] for i in train_signals], axis=0), device=device)
-all_y = torch.tensor(np.expand_dims(normalized_y, axis=1), device=device, dtype=torch.float32)
-dataset = torch.utils.data.TensorDataset(all_x, all_y)
-dataset_size = len(dataset)
-
-# Split dataset into train (80%) and validation (20%)
-train_size = int(0.8 * dataset_size)
-val_size = dataset_size - train_size
-train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
-
-def _hard_gate_indices(logits, tau):
-    """Straight-through Gumbel-Softmax → one-hot → indices"""
-    gate = F.gumbel_softmax(logits, tau=tau, hard=True)       # [B, N]
-    idx  = gate.argmax(dim=1)                                 # [B]
-    return gate, idx
-
-def _split_expert_counts(total_blocks: int):
+    Training uses hard straight-through Gumbel-Softmax. Evaluation removes
+    Gumbel noise and uses a deterministic argmax, as stated in the manuscript.
     """
-    return: (num_dnn, num_snn)
-      even  -> (K/2, K/2)
-      odd   -> (ceil(K/2), floor(K/2))  # DNN 하나 더
-    """
-    num_dnn = (total_blocks + 1) // 2      # 올림
-    num_snn = total_blocks // 2            # 내림
-    return num_dnn, num_snn
+
+    if training:
+        tau_tensor = torch.as_tensor(tau, device=logits.device, dtype=logits.dtype).clamp_min(1e-4)
+        gate = F.gumbel_softmax(logits, tau=tau_tensor, hard=True, dim=-1)
+        index = gate.argmax(dim=-1)
+    else:
+        index = logits.argmax(dim=-1)
+        gate = F.one_hot(index, num_classes=logits.shape[-1]).to(logits.dtype)
+    return gate, index
+
+
+def _relaxed_probabilities(logits: torch.Tensor, tau: torch.Tensor | float) -> torch.Tensor:
+    """Deterministic relaxed routing probabilities for expected-energy loss."""
+
+    tau_tensor = torch.as_tensor(tau, device=logits.device, dtype=logits.dtype).clamp_min(1e-4)
+    return F.softmax(logits / tau_tensor, dim=-1)
+
 
 @torch.no_grad()
-def anneal_and_clamp_tau(model, sched_tau, tau_max=None):
-    """
-    Sched_tau: 이번 epoch 목표 하한값
-    tau_max  : 선택. 상한을 주고 싶으면 숫자 넣기
-    """
-    for m in model.modules():
-        if hasattr(m, 'tau'):
-            # optimizer step으로 갱신된 값을 가져온 뒤 ↓ 하한/상한 클램프
+def anneal_and_clamp_tau(model: nn.Module, scheduled_tau: float, tau_max: Optional[float] = None) -> None:
+    for module in model.modules():
+        if hasattr(module, "tau"):
             if tau_max is None:
-                m.tau.data.clamp_(min=sched_tau)
+                module.tau.data.clamp_(min=scheduled_tau)
             else:
-                m.tau.data.clamp_(min=sched_tau, max=tau_max)
+                module.tau.data.clamp_(min=scheduled_tau, max=tau_max)
 
-# ───────── Energy constants (pJ) ─────────
-E_MAC = 3.1        # Multiply
-E_AC  = 0.1        # Accumulate
 
-# SNN sparsity 평균값
-T_STEPS        = 2        # simulation timesteps
-SPIKE_RATE_AVG = 0.18     # 평균 spike rate
-
-# ───────── pJ-리스트용 에너지 계산 함수 ─────────
-def compute_expected_energy_precalc(gate_logits, energy_costs_pJ, tau=1.0):
-    """
-    energy_costs_pJ : 이미 pJ 단위로 계산된 [K] 리스트
-    gate_logits     : (B, K)
-    반환값           : 배치 평균 에너지 (J 단위)
-    """
-    import torch.nn.functional as F  # 로컬 import
-    probs = F.gumbel_softmax(gate_logits, tau=tau, hard=False)  # (B,K)
-    e_pJ  = gate_logits.new_tensor(energy_costs_pJ)             # (K)
-
-    return (probs * e_pJ).sum(dim=1).mean() * 1e-12             # → J
-
-class DSConv1d(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=False):
-        super(DSConv1d, self).__init__()
-        self.depthwise = nn.Conv1d(in_channels, in_channels, kernel_size=kernel_size,
-                                   stride=stride, padding=padding, groups=in_channels, bias=bias)
-        self.pointwise = nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=bias)
-
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-
-        return x
-
-class DSConv2d(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride=1, padding=0, bias: bool = False):
+# ---------------------------------------------------------------------------
+# Network building blocks
+# ---------------------------------------------------------------------------
+class SEBlock2d(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
         super().__init__()
-
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size,
-                                   stride=stride, padding=padding, groups=in_channels, bias=bias)
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
-
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-
-        return x
-
-class SEBlock1D(nn.Module):
-    def __init__(self, channels, reduction=4):
-        super(SEBlock1D, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        hidden = max(1, channels // reduction)
+        self.channels = channels
+        self.reduction = reduction
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=True),
+            nn.Linear(channels, hidden, bias=True),
             nn.ReLU(inplace=False),
-            nn.Linear(channels // reduction, channels, bias=True),
-            nn.Sigmoid()
+            nn.Linear(hidden, channels, bias=True),
+            nn.Sigmoid(),
         )
 
-    def forward(self, x):
-        # x: (batch, channels, L)
-        b, c, _ = x.size()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, _, _ = x.shape
+        scale = self.avg_pool(x).view(b, c)
+        scale = self.fc(scale).view(b, c, 1, 1)
+        return x * scale
 
-        # Global average pooling: (batch, channels)
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1)
 
-        return x * y
-
-class DSConv1dSE(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=False, reduction=4):
-        super(DSConv1dSE, self).__init__()
-        self.depthwise = nn.Conv1d(in_channels, in_channels, kernel_size=kernel_size,
-                                   stride=stride, padding=padding, groups=in_channels, bias=bias)
-        self.pointwise = nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=bias)
-        self.bn = nn.BatchNorm1d(out_channels)
+class DSConv2dSE(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int | Tuple[int, int],
+        stride: int = 1,
+        padding: int = 0,
+        bias: bool = False,
+        reduction: int = 4,
+    ):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=in_channels,
+            bias=bias,
+        )
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
+        self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=False)
-        self.se = SEBlock1D(out_channels, reduction)
+        self.se = SEBlock2d(out_channels, reduction)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.depthwise(x)
         out = self.pointwise(out)
         out = self.bn(out)
         out = self.relu(out)
-        out = self.se(out)
+        return self.se(out)
 
-        return out
-
-class SEBlock2d(nn.Module):
-    def __init__(self, channels: int, reduction: int = 4):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # (B, C, 1, 1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=True),
-            nn.ReLU(inplace=False),
-            nn.Linear(channels // reduction, channels, bias=True),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)   # squeeze (B, C)
-        y = self.fc(y).view(b, c, 1, 1)   # excite  (B, C,1,1)
-        return x * y                      # scale
-
-class DSConv2dSE(nn.Module):
-    def __init__(self,
-                 in_channels: int, out_channels: int, kernel_size, stride=1, padding=0,
-                 bias: bool = False, reduction: int = 4):
-        super().__init__()
-
-        # depthwise: groups=in_channels
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, stride=stride,
-            padding=padding, groups=in_channels, bias=bias)
-
-        # pointwise: 1×1 conv
-        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        self.bn   = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=False)
-        self.se   = SEBlock2d(out_channels, reduction)
-
-    def forward(self, x):
-        out = self.depthwise(x)
-        out = self.pointwise(out)  # (B, Cout, H, W)
-        out = self.bn(out)
-        out = self.relu(out)
-        out = self.se(out)
-
-        return out
 
 class SlimmableDSConv2dSE(nn.Module):
+    """Sample-wise slimmable DPSC block with switchable BN.
+
+    The gate chooses one width per sample. During training, hard straight-
+    through Gumbel routing is used. During evaluation, the choice is a
+    deterministic argmax. Only the selected width is executed for each sample,
+    and only that width's BN statistics are updated.
     """
-    DSConv2d + SE + 폭(slimmable) + Learned 1×1 up-projection.
-    Args:
-        in_channels : 입력 채널(Cin)
-        max_out     : point-wise 최대 출력 채널(Cout_max)
-        kernel_size : depth-wise 커널 크기 (3 추천)
-        widths      : 폭 비율 리스트, ex (0.25, 0.5, 0.75, 1.0)
-    """
-    def __init__(self, in_channels, max_out, kernel_size=3,
-                 widths=(0.25, 0.5, 0.75, 1.0),
-                 stride=1, padding=1, bias=False, reduction=4):
+
+    def __init__(
+        self,
+        in_channels: int,
+        max_out: int,
+        kernel_size: int = 3,
+        widths: Sequence[float] = DEFAULT_WIDTHS,
+        stride: int = 1,
+        padding: int = 1,
+        bias: bool = False,
+        reduction: int = 4,
+    ):
         super().__init__()
-        self.widths   = widths
-        self.max_out  = max_out
+        self.in_channels = int(in_channels)
+        self.max_out = int(max_out)
+        self.widths = tuple(float(v) for v in widths)
+        self.keep_channels = tuple(int(round(self.max_out * v)) for v in self.widths)
+        if len(set(self.keep_channels)) != len(self.keep_channels):
+            raise ValueError(f"Width multipliers produce duplicate channel counts: {self.keep_channels}")
 
-        # (1) depth-wise
-        self.depthwise = nn.Conv2d(in_channels, in_channels,
-                                   kernel_size=kernel_size, stride=stride,
-                                   padding=padding, groups=in_channels, bias=bias)
-
-        # (2) point-wise full weight (max_out filters)
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            groups=in_channels,
+            bias=bias,
+        )
         self.pointwise = nn.Conv2d(in_channels, max_out, kernel_size=1, bias=bias)
+        self.bn_list = nn.ModuleList([nn.BatchNorm2d(k) for k in self.keep_channels])
+        self.relu = nn.ReLU(inplace=False)
+        self.se_list = nn.ModuleList([SEBlock2d(k, reduction) for k in self.keep_channels])
+        self.gate_fc = nn.Linear(in_channels, len(self.widths))
+        self.tau = nn.Parameter(torch.tensor(1.0))
 
-        # (3) 폭별 BN & SE
-        self.bn_list = nn.ModuleList([nn.BatchNorm2d(int(max_out * r)) for r in widths])
-        self.relu    = nn.ReLU(inplace=False)
-        self.se_list = nn.ModuleList([SEBlock2d(int(max_out * r), reduction) for r in widths])
-
-        # (4) 폭 게이트
-        self.gate_fc = nn.Linear(in_channels, len(widths))
-        self.tau     = nn.Parameter(torch.tensor(1.0))       # learnable temperature
-
-        # (5) Learned 1×1 up-projection (max_out → max_out)
+        # This layer exists in the original implementation; it is retained and
+        # explicitly counted by the revised FLOP profiler.
         self.up = nn.Conv2d(max_out, max_out, kernel_size=1, bias=False)
         with torch.no_grad():
-            eye = torch.eye(max_out)                          # identity init
+            eye = torch.eye(max_out)
             self.up.weight.copy_(eye.view(max_out, max_out, 1, 1))
 
-    # ------------------------------------------------------
-    def forward(self, x):
-        # depth-wise
-        out = self.depthwise(x)                               # (B,Cin,H,W)
+        self.last_width_logits: Optional[torch.Tensor] = None
+        self.last_width_index: Optional[torch.Tensor] = None
 
-        # 폭 선택
-        logits = self.gate_fc(F.adaptive_avg_pool2d(out,1).flatten(1))
-        gate   = F.gumbel_softmax(logits, tau=self.tau, hard=True)
-        idx    = gate.float().mean(0).argmax().item()         # 배치 평균으로 1개 선택
-        keep   = int(self.max_out * self.widths[idx])         # 활성 채널 수
-
-        # point-wise slice
-        w_pw = self.pointwise.weight[:keep]                   # (keep,Cin,1,1)
-        out  = F.conv2d(out, w_pw, None, 1, 0)                # (B,keep,H,W)
-
-        # 전용 BN + SE
-        out  = self.bn_list[idx](out)
-        out  = self.relu(out)
-        out  = self.se_list[idx](out)
-
-        # zero-pad → (B,max_out,H,W)
+    def _forward_selected_width(self, depthwise_out: torch.Tensor, width_index: int) -> torch.Tensor:
+        keep = self.keep_channels[width_index]
+        weight = self.pointwise.weight[:keep]
+        bias = self.pointwise.bias[:keep] if self.pointwise.bias is not None else None
+        out = F.conv2d(depthwise_out, weight, bias, stride=1, padding=0)
+        out = self.bn_list[width_index](out)
+        out = self.relu(out)
+        out = self.se_list[width_index](out)
         if keep < self.max_out:
-            pad = out.new_zeros(out.size(0), self.max_out - keep, *out.shape[2:])
-            out = torch.cat([out, pad], dim=1)
+            pad = out.new_zeros(out.shape[0], self.max_out - keep, *out.shape[2:])
+            out = torch.cat((out, pad), dim=1)
+        return self.up(out)
 
-        # learned 1×1 up-projection  (초깃값은 identity, 훈련 중 fine-tune)
-        out = self.up(out)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        depthwise_out = self.depthwise(x)
+        pooled = F.adaptive_avg_pool2d(depthwise_out, 1).flatten(1)
+        logits = self.gate_fc(pooled)
+        gate, width_index = _select_gate(logits, self.tau, self.training)
+
+        out = depthwise_out.new_zeros(
+            depthwise_out.shape[0], self.max_out, depthwise_out.shape[2], depthwise_out.shape[3]
+        )
+        for k in range(len(self.widths)):
+            selected = (width_index == k).nonzero(as_tuple=True)[0]
+            if selected.numel() == 0:
+                continue
+            path = self._forward_selected_width(depthwise_out[selected], k)
+            # Forward value is unchanged (the selected hard gate is one), while
+            # the straight-through gate supplies a gradient to the width router.
+            scale = gate[selected, k].view(-1, 1, 1, 1)
+            out[selected] = path * scale
 
         self.last_width_logits = logits
-
+        self.last_width_index = width_index
         return out
 
-class DepthGate(nn.Module):
-    def __init__(self, in_feat, max_depth=3, init_tau=1.0):
-        super().__init__()
-        self.tau = nn.Parameter(torch.tensor(init_tau))
-        self.fc  = nn.Linear(in_feat, max_depth)  # depth=1,2,3 중 택1
-
-    def forward(self, feat):        # feat: ConvMoE flatten or pooled
-        logits = self.fc(feat)      # (B, D)
-        probs   = F.gumbel_softmax(logits, tau=self.tau.clamp(min=0.5), hard=True)
-        depth  = probs.argmax(dim=1) + 1  # 1~D
-
-        return depth, probs, logits
-
-class LinearBlockWithDynamicGate(nn.Module):
-    """
-        Pre-gating hard-gate MoE for linear experts (half DNN, half SNN).
-        """
-
-    def __init__(self, in_features, out_features,
-                 num_blocks_linear, num_steps, init_tau=1.0):
-        super().__init__()
-        num_dnn, num_snn = _split_expert_counts(num_blocks_linear)
-        self.num_steps = num_steps
-        self.tau = nn.Parameter(torch.tensor(float(init_tau)))
-
-        # experts
-        self.dnn_experts = nn.ModuleList([
-            nn.Sequential(nn.Linear(in_features, out_features),
-                          nn.ReLU())
-            for _ in range(num_dnn)
-        ])
-        self.snn_experts = nn.ModuleList([
-            nn.Sequential(nn.Linear(in_features, out_features),
-                          neuron.IFNode(v_threshold=1., v_reset=0.,
-                                        surrogate_function=surrogate.ATan()))
-            for _ in range(num_snn)
-        ])
-
-        self.gate_linear = nn.Linear(in_features, num_blocks_linear)
-
-    # -------------------------------------------
-    def forward(self, x):  # x: [B, Fin]
-        b = x.size(0)
-        logits = self.gate_linear(x)  # [B, N]
-        _, idx = _hard_gate_indices(logits, self.tau)
-
-        out_k_list, sel_list = [], []
-
-        # DNN
-        for k, expert in enumerate(self.dnn_experts):
-            sel = (idx == k).nonzero(as_tuple=True)[0]
-            if sel.numel() == 0:
-                continue
-            out_k = expert(x[sel])
-            out_k_list.append(out_k)
-            sel_list.append(sel)
-
-        # SNN
-        offset = len(self.dnn_experts)
-        for k, expert in enumerate(self.snn_experts):
-            sel = (idx == offset + k).nonzero(as_tuple=True)[0]
-            if sel.numel() == 0:
-                continue
-            spk_sum = 0
-            for _ in range(self.num_steps):
-                spk_sum += expert(x[sel])
-                functional.reset_net(expert)
-            out_k = spk_sum / self.num_steps
-            out_k_list.append(out_k)
-            sel_list.append(sel)
-
-        # re-assemble
-        feat_dim = out_k_list[0].size(1)
-        out = x.new_zeros(b, feat_dim)  # (batch, 64)
-
-        for sel, out_k in zip(sel_list, out_k_list):
-            out[sel] = out_k
-
-        self.last_expert_logits = logits
-
-        return out
 
 class ConvMicroBlock(nn.Module):
-    """DSConv2dSE → BN → ReLU → MaxPool2d(2)"""
-    def __init__(self, conv_in, conv_out):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.core = nn.Sequential(
-            DSConv2dSE(conv_in, conv_out, kernel_size=3, stride=1, padding=1, bias=True),
-            nn.BatchNorm2d(conv_out),
+            DSConv2dSE(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=False),
-            nn.MaxPool2d(2, 2)          # 10×16 → 5×8 → 2×4 ...
+            nn.MaxPool2d(2, 2),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.core(x)
+
 
 class SlimmableConvMicroBlock(nn.Module):
-    """SlimmableDSConv2dSE → BN → ReLU → MaxPool2d(2)"""
-    def __init__(self, conv_in, conv_out):
+    def __init__(self, in_channels: int, out_channels: int):
         super().__init__()
         self.core = nn.Sequential(
-            SlimmableDSConv2dSE(conv_in, conv_out, kernel_size=3, stride=1, padding=1, bias=True),
-            # nn.BatchNorm2d(conv_out),
-            # nn.ReLU(inplace=False),
-            nn.MaxPool2d(2, 2)          # 10×16 → 5×8 → 2×4 ...
+            SlimmableDSConv2dSE(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True),
+            nn.MaxPool2d(2, 2),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.core(x)
 
+
 class DepthGateConv(nn.Module):
-    def __init__(self, in_channels, max_depth=3, init_tau=1.0):
+    def __init__(self, in_channels: int, max_depth: int = 2, init_tau: float = 1.0):
         super().__init__()
-        self.tau = nn.Parameter(torch.tensor(init_tau))
-        self.fc  = nn.Linear(in_channels, max_depth)   # hard=True 사용
+        self.tau = nn.Parameter(torch.tensor(float(init_tau)))
+        self.fc = nn.Linear(in_channels, max_depth)
 
-    def forward(self, feat):           # feat: (B, Cin)
-        logits = self.fc(feat)
-        gate   = F.gumbel_softmax(logits, tau=self.tau, hard=True)
-        depth  = gate.argmax(dim=1) + 1          # 1~D
+    def forward(self, feature: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = self.fc(feature)
+        gate, index = _select_gate(logits, self.tau, self.training)
+        return index + 1, gate, logits
 
-        return depth, gate
+
+class DepthGate(nn.Module):
+    def __init__(self, in_features: int, max_depth: int = 2, init_tau: float = 1.0):
+        super().__init__()
+        self.tau = nn.Parameter(torch.tensor(float(init_tau)))
+        self.fc = nn.Linear(in_features, max_depth)
+
+    def forward(self, feature: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = self.fc(feature)
+        gate, index = _select_gate(logits, self.tau, self.training)
+        return index + 1, gate, logits
+
+
+class LinearBlockWithDynamicGate(nn.Module):
+    """One SNN expert and one DNN expert with hard input-dependent routing.
+
+    Gate class order is fixed to [SNN, DNN], matching the manuscript's routing
+    label definition r=0 for SNN and r=1 for DNN.
+    """
+
+    def __init__(self, in_features: int, out_features: int, num_steps: int, init_tau: float = 1.0):
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.num_steps = int(num_steps)
+        if self.num_steps < 1:
+            raise ValueError("num_steps must be >= 1")
+
+        self.dnn_expert = nn.Sequential(nn.Linear(in_features, out_features), nn.ReLU())
+        self.snn_expert = nn.Sequential(
+            nn.Linear(in_features, out_features),
+            neuron.IFNode(
+                v_threshold=1.0,
+                v_reset=0.0,
+                surrogate_function=surrogate.ATan(),
+            ),
+        )
+        self.gate_linear = nn.Linear(in_features, 2)  # class 0=SNN, class 1=DNN
+        self.tau = nn.Parameter(torch.tensor(float(init_tau)))
+
+        self.last_expert_logits: Optional[torch.Tensor] = None
+        self.last_expert_index: Optional[torch.Tensor] = None
+        self.last_candidate_outputs: Optional[torch.Tensor] = None
+
+    def _run_snn(self, x: torch.Tensor) -> torch.Tensor:
+        # Membrane state is preserved across the configured time steps and is
+        # reset only before/after the sample batch, matching multi-step SNN use.
+        functional.reset_net(self.snn_expert)
+        spike_sum: Optional[torch.Tensor] = None
+        for _ in range(self.num_steps):
+            current = self.snn_expert(x)
+            spike_sum = current if spike_sum is None else spike_sum + current
+        functional.reset_net(self.snn_expert)
+        assert spike_sum is not None
+        return spike_sum / float(self.num_steps)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+        logits = self.gate_linear(x)
+        gate, expert_index = _select_gate(logits, self.tau, self.training)
+
+        if self.training:
+            # Both experts are evaluated for every training sample. This is
+            # required to construct the minimum-error routing label.
+            snn_out = self._run_snn(x)
+            dnn_out = self.dnn_expert(x)
+            candidate_outputs = torch.stack((snn_out, dnn_out), dim=1)  # [B,2,D]
+            out = (candidate_outputs * gate.unsqueeze(-1)).sum(dim=1)
+        else:
+            candidate_outputs = None
+            out = x.new_zeros(x.shape[0], self.out_features)
+
+            selected_snn = (expert_index == 0).nonzero(as_tuple=True)[0]
+            if selected_snn.numel() > 0:
+                out[selected_snn] = self._run_snn(x[selected_snn])
+
+            selected_dnn = (expert_index == 1).nonzero(as_tuple=True)[0]
+            if selected_dnn.numel() > 0:
+                out[selected_dnn] = self.dnn_expert(x[selected_dnn])
+
+        self.last_expert_logits = logits
+        self.last_expert_index = expert_index
+        self.last_candidate_outputs = candidate_outputs
+        return out, logits, candidate_outputs, expert_index
+
+
+# ---------------------------------------------------------------------------
+# Model output and complete SDyNN
+# ---------------------------------------------------------------------------
+class SDyNNOutput(NamedTuple):
+    prediction: torch.Tensor
+    exit_prediction: torch.Tensor
+    conv_depth: torch.Tensor
+    linear_depth: torch.Tensor
+    depth_predictions: torch.Tensor
+    exit_feature: torch.Tensor
+    full_feature: torch.Tensor
+    conv_depth_logits: torch.Tensor
+    linear_depth_logits: torch.Tensor
+    width_logits: List[torch.Tensor]
+    expert_logits: List[torch.Tensor]
+    expert_candidate_predictions: List[Optional[torch.Tensor]]
+    route_info: Dict[str, Any]
+
 
 class Net(nn.Module):
-    """
-    conv_channels : e.g. [64, 64]           (length = #conv blocks)
-    linear_dims   : e.g. [64, 32, 32]       (len = #linear blocks + 1)
-                   ※ linear_dims[0] must equal conv_channels[-1]
-    """
-    def __init__(self,
-                 conv_channels=args.conv_channels,
-                 linear_dims=args.linear_dims,
-                 number_of_blocks_1=args.num_blocks_1,
-                 number_of_blocks_2=args.num_blocks_2):
+    def __init__(
+        self,
+        conv_channels: Sequence[int] = DEFAULT_CONV_CHANNELS,
+        linear_dims: Sequence[int] = DEFAULT_LINEAR_DIMS,
+        number_of_blocks_1: int = 2,
+        number_of_blocks_2: int = 2,
+        num_steps: int = 2,
+    ):
         super().__init__()
+        conv_channels = tuple(int(v) for v in conv_channels)
+        linear_dims = tuple(int(v) for v in linear_dims)
 
-        # ---------- Sanity check ----------
-        assert len(conv_channels) >= 1,           "`conv_channels` must have ≥1 element"
-        assert len(linear_dims) == 3,             "`linear_dims` must be [in1, out1, out2]"
-        assert linear_dims[0] == conv_channels[-1], \
-            "linear_dims[0] must equal last conv out-channels"
+        if len(conv_channels) != 2:
+            raise ValueError("The manuscript architecture requires exactly two convolution blocks.")
+        if len(linear_dims) != 3:
+            raise ValueError("linear_dims must be [input, hidden1, hidden2].")
+        if linear_dims[0] != conv_channels[-1]:
+            raise ValueError("linear_dims[0] must equal the convolution output channel count.")
+        if number_of_blocks_1 != 2 or number_of_blocks_2 != 2:
+            raise ValueError("Each linear block must contain exactly one SNN and one DNN expert.")
 
-        # ---------- Convolution blocks ----------
-        self.conv_blocks = nn.ModuleList()
-        in_c = 2                                         # input: (B,2,10,16)
-        for i, out_c in enumerate(conv_channels):
-            if i == 0:
-                self.conv_blocks.append(ConvMicroBlock(in_c, out_c))
-            else:
-                self.conv_blocks.append(SlimmableConvMicroBlock(in_c, out_c))
-            in_c = out_c
+        self.config = {
+            "conv_channels": list(conv_channels),
+            "linear_dims": list(linear_dims),
+            "number_of_blocks_1": 2,
+            "number_of_blocks_2": 2,
+            "num_steps": int(num_steps),
+        }
+        self.conv_channels = conv_channels
+        self.linear_dims = linear_dims
+        self.num_steps = int(num_steps)
 
-        # Gate가 첫 블록의 GAP vector를 보니까 ↓
-        self.depth_gate_conv = DepthGateConv(in_channels=conv_channels[0], max_depth=len(conv_channels))
+        self.conv_blocks = nn.ModuleList(
+            [
+                ConvMicroBlock(INPUT_SHAPE[0], conv_channels[0]),
+                SlimmableConvMicroBlock(conv_channels[0], conv_channels[1]),
+            ]
+        )
+        self.depth_gate_conv = DepthGateConv(conv_channels[0], max_depth=2)
         self.conv_gap = nn.AdaptiveAvgPool2d((1, 1))
 
-        # ---------- Linear blocks ----------
-        lin_pairs = list(zip(linear_dims[:-1], linear_dims[1:]))  # [(in1,out1), (out1,out2)]
-        self.linear_blocks = nn.ModuleList([
-            LinearBlockWithDynamicGate(in_feat, out_feat,
-                                       (number_of_blocks_1, number_of_blocks_2)[i],
-                                       num_steps=args.num_steps)
-            for i, (in_feat, out_feat) in enumerate(lin_pairs)
-        ])
+        self.linear_blocks = nn.ModuleList(
+            [
+                LinearBlockWithDynamicGate(linear_dims[0], linear_dims[1], num_steps=num_steps),
+                LinearBlockWithDynamicGate(linear_dims[1], linear_dims[2], num_steps=num_steps),
+            ]
+        )
+        self.depth_gate = DepthGate(linear_dims[1], max_depth=2)
 
-        self.depth_gate = DepthGate(in_feat=linear_dims[1], max_depth=len(self.linear_blocks))
-
-        # ---------- Heads ----------
         self.exit1_head = nn.Linear(linear_dims[1], 1)
-        self.fc_pred    = nn.Linear(linear_dims[-1], 1)
+        self.fc_pred = nn.Linear(linear_dims[2], 1)
+        self.proj_feat = nn.Linear(linear_dims[1], linear_dims[2], bias=False)
+        if linear_dims[1] == linear_dims[2]:
+            with torch.no_grad():
+                self.proj_feat.weight.copy_(torch.eye(linear_dims[2]))
 
-        # Feature-hint projector
-        self.proj_feat = nn.Linear(linear_dims[-1], linear_dims[-1], bias=False)
-        with torch.no_grad():
-            self.proj_feat.weight.copy_(torch.eye(linear_dims[-1]))
+        # Stored in checkpoints and used for test-set denormalization.
+        self.y_min: Optional[float] = None
+        self.y_max: Optional[float] = None
 
-    # ------------------------------------------------------------
-    def forward(self, x):
-        B = x.size(0)
-        x = x.view(B, 2, 10, 16)
+    @staticmethod
+    def _predict_candidates(head: nn.Linear, candidate_features: torch.Tensor) -> torch.Tensor:
+        b, k, d = candidate_features.shape
+        return head(candidate_features.reshape(b * k, d)).reshape(b, k)
 
-        # ① Conv stage -------------------------------------------------
-        feat = x
-        for blk in self.conv_blocks:
-            feat = blk(feat)
+    def _forward_convolution(
+        self,
+        x: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        List[torch.Tensor],
+        List[torch.Tensor],
+    ]:
+        batch = x.shape[0]
+        first_feature = self.conv_blocks[0](x)
+        first_gap = self.conv_gap(first_feature).flatten(1)
+        conv_depth, conv_gate, conv_logits = self.depth_gate_conv(first_gap)
 
-        gap_feat = self.conv_gap(feat).view(B, -1)  # (B, conv_channels[-1])
+        width_logits_full = first_gap.new_full((batch, len(DEFAULT_WIDTHS)), float("nan"))
+        width_index_full = torch.full((batch,), -1, device=x.device, dtype=torch.long)
 
-        # ② Linear stage ----------------------------------------------
-        x1 = self.linear_blocks[0](gap_feat)              # first linear
-        y_exit1 = self.exit1_head(x1)
+        if self.training:
+            # Training evaluates both Conv-EE candidates so that the hard
+            # straight-through gate receives task gradients. Inference below
+            # executes only the selected path.
+            second_feature = self.conv_blocks[1](first_feature)
+            second_gap = self.conv_gap(second_feature).flatten(1)
+            gap = first_gap * conv_gate[:, 0:1] + second_gap * conv_gate[:, 1:2]
 
-        # y_stack
-        feats = [x1]  # depth 1
-        for i in range(1, len(self.linear_blocks)):  # depth 2…N
-            feats.append(self.linear_blocks[i](feats[-1]))
-        feat_stack = torch.stack(feats, dim=1)  # (B, N, hidden)
-        y_stack = self.fc_pred(feat_stack).squeeze(-1)  # (B, N)
+            core = self.conv_blocks[1].core[0]
+            assert core.last_width_logits is not None and core.last_width_index is not None
+            width_logits_full = core.last_width_logits
+            width_index_full = core.last_width_index
+        else:
+            gap = first_gap.clone()
+            selected_full = (conv_depth == 2).nonzero(as_tuple=True)[0]
+            if selected_full.numel() > 0:
+                second_feature = self.conv_blocks[1](first_feature[selected_full])
+                second_gap = self.conv_gap(second_feature).flatten(1)
+                gap[selected_full] = second_gap
 
-        depth_l, gate_probs, gate_logits = self.depth_gate(x1)
+                core = self.conv_blocks[1].core[0]
+                assert core.last_width_logits is not None and core.last_width_index is not None
+                width_logits_full[selected_full] = core.last_width_logits
+                width_index_full[selected_full] = core.last_width_index
 
-        out_lin = x1.clone()
-        sel_l = (depth_l == 2).nonzero(as_tuple=True)[0]
-        if sel_l.numel():
-            out_lin[sel_l] = self.linear_blocks[1](out_lin[sel_l])
+        return gap, conv_depth, conv_gate, conv_logits, [width_logits_full], [width_index_full]
 
-        y_final = self.fc_pred(out_lin)
+    def forward(self, x: torch.Tensor) -> SDyNNOutput:
+        batch = x.shape[0]
+        x = x.view(batch, *INPUT_SHAPE)
 
-        # width logits: conv_blocks[1:] 에만 있음
-        width_logits = [blk.core[0].last_width_logits for blk in self.conv_blocks[1:]]
+        gap, conv_depth, _, conv_logits, width_logits, width_indices = self._forward_convolution(x)
 
-        # expert logits: 모든 linear_blocks
-        expert_logits = [lb.last_expert_logits for lb in self.linear_blocks]
+        # First linear MoE block is always reached.
+        x1, expert_logits_1, candidates_1, expert_index_1 = self.linear_blocks[0](gap)
+        linear_depth, linear_gate, linear_logits = self.depth_gate(x1)
 
-        return y_final, y_exit1, depth_l, y_stack, x1, out_lin, gate_logits, \
-            width_logits, expert_logits # depth_c 미사용이면 None
+        expert_logits_2_full = x1.new_full((batch, 2), float("nan"))
+        expert_index_2_full = torch.full((batch,), -1, device=x.device, dtype=torch.long)
 
-tau0, tau_min, tau_gamma = 5.0, 0.3, 0.96
+        if self.training:
+            # Both linear depths are evaluated during training for the EE
+            # supervision losses and the minimum-error label of block 2.
+            y_exit = self.exit1_head(x1)
+            x2, expert_logits_2, candidates_2, expert_index_2 = self.linear_blocks[1](x1)
+            y_full = self.fc_pred(x2)
+            y_final = y_exit * linear_gate[:, 0:1] + y_full * linear_gate[:, 1:2]
+            final_feature = x2
+            expert_logits_2_full = expert_logits_2
+            expert_index_2_full = expert_index_2
 
-def gradnorm_update(losses, params, eta=1.5):
-    # 처음 1iteration 때 losses_i(0) 저장 → 매 iter 갱신
-    if not isinstance(params, (list, tuple)):
-        params = list(params)
-    if len(params) == 0:
-        raise ValueError("Parameter list is empty!")
+            assert candidates_1 is not None and candidates_2 is not None
+            candidate_pred_1 = self._predict_candidates(self.exit1_head, candidates_1)
+            candidate_pred_2 = self._predict_candidates(self.fc_pred, candidates_2)
+            candidate_predictions: List[Optional[torch.Tensor]] = [candidate_pred_1, candidate_pred_2]
+            depth_predictions = torch.cat((y_exit, y_full), dim=1)
+        else:
+            # True early exit: an intermediate predictor is evaluated only for
+            # depth-1 samples, while block 2 and the final predictor are
+            # evaluated only for depth-2 samples.
+            y_exit = x1.new_full((batch, 1), float("nan"))
+            y_full_placeholder = x1.new_full((batch, 1), float("nan"))
+            y_final = x1.new_zeros((batch, 1))
+            final_feature = x1.clone()
 
-    if not hasattr(gradnorm_update, "init_losses"):
-        gradnorm_update.init_losses = [l.detach() for l in losses]
-        gradnorm_update.ws = [1.0]*len(losses)
+            selected_exit = (linear_depth == 1).nonzero(as_tuple=True)[0]
+            if selected_exit.numel() > 0:
+                exit_value = self.exit1_head(x1[selected_exit])
+                y_exit[selected_exit] = exit_value
+                y_final[selected_exit] = exit_value
 
-    # 각 브랜치 그래드 L2-norm
-    G = []
-    for l in losses:
-        grads = torch.autograd.grad(l, params, retain_graph=True, create_graph=True, allow_unused=True)
-        valid = [g.norm() for g in grads if g is not None]
-        norm = torch.stack(valid).mean() if valid else l.new_tensor(0.)
-        G.append(norm)
+            selected_full = (linear_depth == 2).nonzero(as_tuple=True)[0]
+            if selected_full.numel() > 0:
+                x2, logits_2, _, index_2 = self.linear_blocks[1](x1[selected_full])
+                y_full = self.fc_pred(x2)
+                y_final[selected_full] = y_full
+                final_feature[selected_full] = x2
+                y_full_placeholder[selected_full] = y_full
+                expert_logits_2_full[selected_full] = logits_2
+                expert_index_2_full[selected_full] = index_2
 
-    # target
-    G_mean = torch.stack(G).mean().detach()
-    # 새로운 가중치
-    ws = []
-    for i,(w0,L0,g) in enumerate(zip(gradnorm_update.ws, gradnorm_update.init_losses, G)):
-        r   = (losses[i]/L0).detach()
-        ws.append((w0 * (r**eta) * (G_mean/g).detach()).clamp(min=1e-3))
+            candidate_predictions = [None, None]
+            depth_predictions = torch.cat((y_exit, y_full_placeholder), dim=1)
 
-    # normalize
-    s = sum(ws); ws = [w/s for w in ws]
-    gradnorm_update.ws = ws
+        route_info: Dict[str, Any] = {
+            "conv_depth": conv_depth,
+            "linear_depth": linear_depth,
+            "width_indices": width_indices,
+            "expert_indices": [expert_index_1, expert_index_2_full],
+        }
 
-    return ws
+        return SDyNNOutput(
+            prediction=y_final,
+            exit_prediction=y_exit,
+            conv_depth=conv_depth,
+            linear_depth=linear_depth,
+            depth_predictions=depth_predictions,
+            exit_feature=x1,
+            full_feature=final_feature,
+            conv_depth_logits=conv_logits,
+            linear_depth_logits=linear_logits,
+            width_logits=width_logits,
+            expert_logits=[expert_logits_1, expert_logits_2_full],
+            expert_candidate_predictions=candidate_predictions,
+            route_info=route_info,
+        )
 
-def compute_layer_ops(model: nn.Module, input_size: tuple):
+
+# ---------------------------------------------------------------------------
+# Correct analytical operation/FLOP accounting
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class OperationCost:
+    macs: float = 0.0
+    acs: float = 0.0
+    other_ops: float = 0.0
+
+    def __add__(self, other: "OperationCost") -> "OperationCost":
+        return OperationCost(
+            self.macs + other.macs,
+            self.acs + other.acs,
+            self.other_ops + other.other_ops,
+        )
+
+    def __mul__(self, scalar: float) -> "OperationCost":
+        return OperationCost(self.macs * scalar, self.acs * scalar, self.other_ops * scalar)
+
+    __rmul__ = __mul__
+
+    @property
+    def flops(self) -> float:
+        # One dense MAC contains one multiplication and one accumulation.
+        return 2.0 * self.macs + self.acs + self.other_ops
+
+    @property
+    def energy_pj(self) -> float:
+        return self.macs * (E_MAC_PJ + E_AC_PJ) + self.acs * E_AC_PJ
+
+
+def _conv2d_macs(
+    in_channels: int,
+    out_channels: int,
+    kernel_size: int | Tuple[int, int],
+    out_h: int,
+    out_w: int,
+    groups: int = 1,
+) -> int:
+    if isinstance(kernel_size, int):
+        kh = kw = kernel_size
+    else:
+        kh, kw = kernel_size
+    if in_channels % groups != 0:
+        raise ValueError("in_channels must be divisible by groups")
+    return int(out_h * out_w * out_channels * (in_channels // groups) * kh * kw)
+
+
+def _linear_macs(in_features: int, out_features: int) -> int:
+    return int(in_features * out_features)
+
+
+def _gap_ops(channels: int, height: int, width: int) -> int:
+    # Additions needed for global averaging; division is one further operation
+    # per channel. This is routing/auxiliary overhead, not a MAC.
+    return int(channels * max(0, height * width - 1) + channels)
+
+
+def _se_cost(channels: int, height: int, width: int, reduction: int = 4) -> OperationCost:
+    hidden = max(1, channels // reduction)
+    fc_macs = _linear_macs(channels, hidden) + _linear_macs(hidden, channels)
+    scale_multiplies = channels * height * width
+    return OperationCost(macs=fc_macs + scale_multiplies, other_ops=_gap_ops(channels, height, width))
+
+
+def build_operation_costs(net: Net, spike_rate: float = SPIKE_RATE_AVG) -> Dict[str, Any]:
+    """Build route-component costs without stochastic hooks.
+
+    This fixes the previous counter by handling depthwise ``groups`` correctly,
+    counting the functional sliced pointwise convolution, and keeping repeated
+    route components separate instead of overwriting hook results.
     """
-    Automatically computes the number of operations (MACs) per layer using formulas from the paper:
-    - Conv2d: OPS = Cin * Cout * kH * kW * Hout * Wout
-    - Linear: OPS = in_features * out_features
 
-    model: Your PyTorch nn.Module
-    input_size: Tuple specifying (batch_size, channels, height, width) for an example input
+    c0, c1 = net.conv_channels
+    _, h0, w0 = INPUT_SHAPE
+    h1, w1 = h0 // 2, w0 // 2
+    h2, w2 = h1 // 2, w1 // 2
 
-    Returns a dict mapping layer names to their OPS count.
-    """
-    ops = {}
-    hooks = []
+    conv1 = OperationCost(
+        macs=(
+            _conv2d_macs(INPUT_SHAPE[0], INPUT_SHAPE[0], 3, h0, w0, groups=INPUT_SHAPE[0])
+            + _conv2d_macs(INPUT_SHAPE[0], c0, 1, h0, w0)
+        )
+    ) + _se_cost(c0, h0, w0)
 
-    def conv_hook(self, input, output):
-        Cin = input[0].shape[1]
-        Cout = output.shape[1]
-        Hout, Wout = output.shape[2], output.shape[3]
-        kH, kW = self.kernel_size
-        layer_ops = Cin * Cout * kH * kW * Hout * Wout
-        ops[self] = layer_ops
+    conv_depth_gate = OperationCost(
+        macs=_linear_macs(c0, 2),
+        other_ops=_gap_ops(c0, h1, w1),
+    )
 
-    def linear_hook(self, input, output):
-        Cin = input[0].shape[1]
-        Cout = output.shape[1]
-        layer_ops = Cin * Cout
-        ops[self] = layer_ops
+    width_gate = OperationCost(
+        macs=_linear_macs(c0, len(DEFAULT_WIDTHS)),
+        other_ops=_gap_ops(c0, h1, w1),
+    )
 
-    # Register hooks on each Conv2d and Linear
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Conv2d):
-            hooks.append((name, module.register_forward_hook(conv_hook)))
-        elif isinstance(module, nn.Linear):
-            hooks.append((name, module.register_forward_hook(linear_hook)))
+    conv2_by_width: List[OperationCost] = []
+    for keep in net.conv_blocks[1].core[0].keep_channels:
+        dynamic_conv = OperationCost(
+            macs=(
+                _conv2d_macs(c0, c0, 3, h1, w1, groups=c0)
+                + _conv2d_macs(c0, keep, 1, h1, w1)
+                + _conv2d_macs(c1, c1, 1, h1, w1)  # retained learned up-projection
+            ),
+            other_ops=_gap_ops(c1, h2, w2),
+        )
+        conv2_by_width.append(dynamic_conv + _se_cost(keep, h1, w1))
 
-    # Run a forward pass with dummy input
-    model.eval()
-    with torch.no_grad():
-        model(torch.randn(input_size, device=next(model.parameters()).device))
+    linear_experts: List[List[OperationCost]] = []
+    expert_gates: List[OperationCost] = []
+    for block in net.linear_blocks:
+        dense_macs = _linear_macs(block.in_features, block.out_features)
+        snn_acs = dense_macs * spike_rate * block.num_steps
+        linear_experts.append(
+            [
+                OperationCost(acs=snn_acs),        # class 0: SNN
+                OperationCost(macs=dense_macs),    # class 1: DNN
+            ]
+        )
+        expert_gates.append(OperationCost(macs=_linear_macs(block.in_features, 2)))
 
-    # Clean up hooks and build result dict
-    result = {}
-    for name, hook in hooks:
-        module = dict(model.named_modules())[name]
-        result[name] = ops.get(module, 0)
-        hook.remove()
-
-    return result
-
-def build_gate_ops_tables(net, layer_ops):
-    """
-    layer_ops : compute_layer_ops() 로 얻은 {모듈경로: MACs} 딕셔너리
-    net       : 학습에 사용할 모델
-    반환값     : {
-        "width_ops" : [MACs_per_width],
-        "expert_ops_list" : [[blk0_e0, …],  [blk1_e0, …],  …],
-        "depth_ops" : [MACs_depth1, MACs_depth2, …],
-    }
-    ------------------------------------------------------------------
-    * 폭(width)  : conv_blocks[1:], pointwise 레이어 기준
-    * 익스퍼트   : 각 LinearBlock 안의 dnn_experts.*, snn_experts.* 중
-                  “*.0” (Linear/Conv 본체) 만 집계
-    * 깊이(depth): early-exit 레벨별 누적 MACs (예시는 exit1 / full)
-    """
-
-    # ========== ① WIDTH 게이트 ==========
-    width_ops = []
-    for idx, blk in enumerate(net.conv_blocks[1:], start=1):  # conv_blocks[1:] 만 dynamic
-        # 해당 블록의 pointwise 레이어 이름을 찾아 layer_ops에서 MACs 추출
-        pattern = fr"conv_blocks\.{idx}\.core\.0\.pointwise"
-        macs = next(m for n, m in layer_ops.items() if re.fullmatch(pattern, n))
-        # 폭 게이트는 ratio(0.25/0.5/…)대로 채널 수만 달라지므로
-        # base MACs × ratio 로 간단히 추정
-        ratios = (0.25, 0.5, 0.75, 1.0)
-        width_ops = [int(macs * r) for r in ratios]
-        break  # 모두 동일 base라 한 번만 계산
-
-    # ========== ② EXPERT 게이트 ==========
-    expert_ops_list = []
-    for i, lb in enumerate(net.linear_blocks):
-        # dnn_experts.*.0     또는 snn_experts.*.0  만 집계
-        pat = fr"linear_blocks\.{i}\.(dnn_experts|snn_experts)\.\d+\.0$"
-        ops_this_blk = [
-            macs for name, macs in layer_ops.items()
-            if re.fullmatch(pat, name)
-        ]
-        expert_ops_list.append(sorted(ops_this_blk))  # K_i 길이 = 해당 블록 전문가 수
-
-    # ========== ③ DEPTH 게이트 ==========
-    #  예시 : exit1 = 폭블록[1] + expert블록[0]
-    #         exit2 = 전체 네트(=full)   ← 수정 가능
-    depth1_macs = 0
-    #  conv_blocks[1] 전체 MAC 합산
-    for name, macs in layer_ops.items():
-        if name.startswith("conv_blocks.1."):
-            depth1_macs += macs
-    #  linear_blocks.0.* 전체 MAC 합산
-    for name, macs in layer_ops.items():
-        if name.startswith("linear_blocks.0."):
-            depth1_macs += macs
-
-    # full 모델 MACs
-    full_macs = sum(layer_ops.values())
-    depth_ops = [depth1_macs, full_macs]
+    linear_depth_gate = OperationCost(macs=_linear_macs(net.linear_dims[1], 2))
+    exit_head = OperationCost(macs=_linear_macs(net.linear_dims[1], 1))
+    final_head = OperationCost(macs=_linear_macs(net.linear_dims[2], 1))
 
     return {
-        "width_ops": width_ops,
-        "expert_ops_list": expert_ops_list,
-        "depth_ops": depth_ops,
+        "conv1": conv1,
+        "conv_depth_gate": conv_depth_gate,
+        "width_gate": width_gate,
+        "conv2_by_width": conv2_by_width,
+        "expert_gates": expert_gates,
+        "linear_experts": linear_experts,
+        "linear_depth_gate": linear_depth_gate,
+        "exit_head": exit_head,
+        "final_head": final_head,
     }
 
-def compute_expected_energy(gate_logits, ops_MACs, E_MAC=E_MAC, E_AC=E_AC, tau=1.0):
-    # Gumbel-Softmax로 soft 확률
-    probs = F.gumbel_softmax(gate_logits, tau=tau, hard=False)   # [B, K]
-    energy_costs = gate_logits.new_tensor(ops_MACs) * (E_MAC + E_AC)  # [K] * pJ
-    #   MACs ≈ ACs 라서  (MAC+AC) × pJ  로 단순화
-    #   더 정밀하게 하려면   MACs*E_MAC + MACs*E_AC  따로 계산해도 OK
-    E_batch_pJ = (probs * energy_costs).sum(dim=1).mean()        # scalar (pJ)
 
-    return E_batch_pJ * 1e-12
+def compute_layer_ops(model: Net, input_size: Tuple[int, int, int, int] = (1, 2, 10, 16)) -> Dict[str, int]:
+    """Compatibility wrapper returning analytical MAC counts by component.
 
-if __name__ == "__main__":
-    # Define loss and optimizer
-    net = Net().to(device)
-    loss_fn = nn.MSELoss()
-    optimizer = torch_optim.Lookahead(optim.RAdam(net.parameters(), lr=learning_rate))
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5,
-                                                     patience=args.schedular_patience)
+    ``input_size`` is validated but route costs are derived analytically from
+    the manuscript architecture. Values are MAC/AC-equivalent operation counts;
+    use :func:`summarize_flops` for conventional FLOPs.
+    """
 
-    layer_ops = compute_layer_ops(net, input_size=(1, 2, 16, 10))
+    if tuple(input_size[1:]) != INPUT_SHAPE:
+        raise ValueError(f"Expected input shape (B,{INPUT_SHAPE}), got {input_size}")
+    costs = build_operation_costs(model)
+    result: Dict[str, int] = {
+        "conv_blocks.0": int(round(costs["conv1"].macs + costs["conv1"].acs)),
+        "depth_gate_conv": int(round(costs["conv_depth_gate"].macs + costs["conv_depth_gate"].other_ops)),
+        "slimmable_width_gate": int(round(costs["width_gate"].macs + costs["width_gate"].other_ops)),
+        "linear_depth_gate": int(round(costs["linear_depth_gate"].macs)),
+        "exit_head": int(round(costs["exit_head"].macs)),
+        "final_head": int(round(costs["final_head"].macs)),
+    }
+    for i, cost in enumerate(costs["conv2_by_width"]):
+        keep = model.conv_blocks[1].core[0].keep_channels[i]
+        result[f"conv_blocks.1.width_{keep}"] = int(round(cost.macs + cost.acs + cost.other_ops))
+    for block_idx, (gate_cost, expert_costs) in enumerate(
+        zip(costs["expert_gates"], costs["linear_experts"])
+    ):
+        result[f"linear_blocks.{block_idx}.gate"] = int(round(gate_cost.macs))
+        result[f"linear_blocks.{block_idx}.snn"] = int(round(expert_costs[0].acs))
+        result[f"linear_blocks.{block_idx}.dnn"] = int(round(expert_costs[1].macs))
+    return result
 
-    expert_energy_pJ_list = []  # ← 리스트의 리스트!
 
-    for i, _ in enumerate(net.linear_blocks):
-        pat = fr"linear_blocks\.{i}\.(dnn_experts|snn_experts)\.\d+\.0$"
-        names_i = [n for n in layer_ops if re.fullmatch(pat, n)]
+def _full_reference_cost(costs: Dict[str, Any]) -> OperationCost:
+    return (
+        costs["conv1"]
+        + costs["conv_depth_gate"]
+        + costs["width_gate"]
+        + costs["conv2_by_width"][-1]
+        + costs["expert_gates"][0]
+        + costs["linear_experts"][0][1]
+        + costs["linear_depth_gate"]
+        + costs["expert_gates"][1]
+        + costs["linear_experts"][1][1]
+        + costs["final_head"]
+    )
 
-        costs_i = []
-        for n in names_i:
-            macs = layer_ops[n]  # AC ≃ MAC
-            if "snn_experts" in n:  # ▸ SNN
-                cost = macs * E_AC * SPIKE_RATE_AVG * T_STEPS
-            else:  # ▸ DNN
-                cost = macs * (E_MAC + E_AC)  # 3.2 pJ × MAC
-            costs_i.append(cost)
 
-        # ↳ 반드시 logits 열 수와 같은 길이가 됨
-        expert_energy_pJ_list.append(costs_i)
+def gate_only_full_path_cost(net: Net) -> OperationCost:
+    costs = build_operation_costs(net)
+    return (
+        costs["conv_depth_gate"]
+        + costs["width_gate"]
+        + costs["expert_gates"][0]
+        + costs["linear_depth_gate"]
+        + costs["expert_gates"][1]
+    )
 
-    gate_ops = build_gate_ops_tables(net, layer_ops)
 
-    width_ops_MACs = gate_ops["width_ops"]  # [K_w]
-    expert_ops_list = gate_ops["expert_ops_list"]  # [[K_e0], [K_e1], …]
-    depth_ops_MACs = gate_ops["depth_ops"]  # [K_d]
+def summarize_flops(net: Net) -> Dict[str, float]:
+    costs = build_operation_costs(net)
+    reference = _full_reference_cost(costs)
+    gate_cost = gate_only_full_path_cost(net)
+    return {
+        "full_reference_flops": reference.flops,
+        "full_path_gate_flops": gate_cost.flops,
+        "gate_fraction_of_full_percent": 100.0 * gate_cost.flops / reference.flops,
+        "ungated_to_gated_increase_percent": 100.0 * gate_cost.flops / (reference.flops - gate_cost.flops),
+    }
 
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    best_model_state = None
 
-    # Training loop with validation (80:20 split)
-    for epoch in range(n_epochs):
+def expected_energy_loss(output: SDyNNOutput, net: Net) -> torch.Tensor:
+    """Equation-(8)--(10)-style normalized expected inference energy."""
+
+    costs = build_operation_costs(net)
+    device = output.prediction.device
+    dtype = output.prediction.dtype
+
+    p_conv = _relaxed_probabilities(output.conv_depth_logits, net.depth_gate_conv.tau)
+    p_width = _relaxed_probabilities(output.width_logits[0], net.conv_blocks[1].core[0].tau)
+    p_linear = _relaxed_probabilities(output.linear_depth_logits, net.depth_gate.tau)
+    p_expert_1 = _relaxed_probabilities(output.expert_logits[0], net.linear_blocks[0].tau)
+    p_expert_2 = _relaxed_probabilities(output.expert_logits[1], net.linear_blocks[1].tau)
+
+    def energy_tensor(items: Sequence[OperationCost]) -> torch.Tensor:
+        return torch.tensor([item.energy_pj for item in items], device=device, dtype=dtype)
+
+    fixed = costs["conv1"].energy_pj + costs["conv_depth_gate"].energy_pj
+    conv2_energy = costs["width_gate"].energy_pj + (p_width * energy_tensor(costs["conv2_by_width"])).sum(dim=1)
+
+    linear1_energy = costs["expert_gates"][0].energy_pj + (
+        p_expert_1 * energy_tensor(costs["linear_experts"][0])
+    ).sum(dim=1)
+    linear2_energy = costs["expert_gates"][1].energy_pj + (
+        p_expert_2 * energy_tensor(costs["linear_experts"][1])
+    ).sum(dim=1)
+
+    head_energy = p_linear[:, 0] * costs["exit_head"].energy_pj + p_linear[:, 1] * (
+        linear2_energy + costs["final_head"].energy_pj
+    )
+
+    expected_pj = (
+        fixed
+        + p_conv[:, 1] * conv2_energy
+        + linear1_energy
+        + costs["linear_depth_gate"].energy_pj
+        + head_energy
+    )
+
+    reference_pj = _full_reference_cost(costs).energy_pj
+    return (expected_pj / reference_pj).mean()
+
+
+
+
+def estimate_inference_gate_flops(output: SDyNNOutput, net: Net) -> torch.Tensor:
+    """Return the routing-network FLOPs actually executed for each sample."""
+
+    costs = build_operation_costs(net)
+    route = output.route_info
+    conv_depth = route["conv_depth"].detach().cpu()
+    linear_depth = route["linear_depth"].detach().cpu()
+
+    values: List[float] = []
+    for i in range(conv_depth.numel()):
+        cost = costs["conv_depth_gate"] + costs["expert_gates"][0] + costs["linear_depth_gate"]
+        if int(conv_depth[i]) == 2:
+            cost = cost + costs["width_gate"]
+        if int(linear_depth[i]) == 2:
+            cost = cost + costs["expert_gates"][1]
+        values.append(cost.flops)
+    return torch.tensor(values, dtype=torch.float64)
+
+def estimate_inference_flops(output: SDyNNOutput, net: Net) -> torch.Tensor:
+    """Return actual route-dependent FLOPs for every sample in ``output``."""
+
+    costs = build_operation_costs(net)
+    route = output.route_info
+    conv_depth = route["conv_depth"].detach().cpu()
+    linear_depth = route["linear_depth"].detach().cpu()
+    width_idx = route["width_indices"][0].detach().cpu()
+    expert_1 = route["expert_indices"][0].detach().cpu()
+    expert_2 = route["expert_indices"][1].detach().cpu()
+
+    values: List[float] = []
+    for i in range(conv_depth.numel()):
+        cost = costs["conv1"] + costs["conv_depth_gate"]
+        if int(conv_depth[i]) == 2:
+            wi = int(width_idx[i])
+            if wi < 0:
+                raise RuntimeError("Conv depth 2 was selected but no width index was recorded.")
+            cost = cost + costs["width_gate"] + costs["conv2_by_width"][wi]
+
+        e1 = int(expert_1[i])
+        if e1 not in (0, 1):
+            raise RuntimeError(f"Invalid first expert index: {e1}")
+        cost = cost + costs["expert_gates"][0] + costs["linear_experts"][0][e1]
+        cost = cost + costs["linear_depth_gate"]
+
+        if int(linear_depth[i]) == 1:
+            cost = cost + costs["exit_head"]
+        else:
+            e2 = int(expert_2[i])
+            if e2 not in (0, 1):
+                raise RuntimeError("Linear depth 2 was selected but no second expert index was recorded.")
+            cost = cost + costs["expert_gates"][1] + costs["linear_experts"][1][e2]
+            cost = cost + costs["final_head"]
+        values.append(cost.flops)
+    return torch.tensor(values, dtype=torch.float64)
+
+
+# ---------------------------------------------------------------------------
+# Loss helpers
+# ---------------------------------------------------------------------------
+def minimum_error_expert_labels(
+    candidate_predictions: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
+    """Build training-only labels: 0=SNN, 1=DNN from the smaller CFO error."""
+
+    if candidate_predictions.ndim != 2 or candidate_predictions.shape[1] != 2:
+        raise ValueError("candidate_predictions must have shape [B,2] in [SNN,DNN] order")
+    target = targets.view(-1, 1)
+    error = (candidate_predictions.detach() - target).abs()
+    return error.argmin(dim=1).long()
+
+
+def binary_expert_routing_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    """Binary cross entropy for P(DNN); class 0=SNN and class 1=DNN."""
+
+    if logits.shape[-1] != 2:
+        raise ValueError("Expert gate logits must have two classes [SNN,DNN].")
+    dnn_logit = logits[:, 1] - logits[:, 0]
+    return F.binary_cross_entropy_with_logits(dnn_logit, labels.to(logits.dtype))
+
+
+def gradnorm_update(losses: Sequence[torch.Tensor], params: Sequence[nn.Parameter], eta: float = 1.5) -> List[torch.Tensor]:
+    """Retain the original GradNorm-inspired multiplicative balancing rule."""
+
+    params = list(params)
+    if not params:
+        raise ValueError("Parameter list is empty")
+
+    if not hasattr(gradnorm_update, "init_losses"):
+        gradnorm_update.init_losses = [loss.detach().clamp_min(1e-8) for loss in losses]
+        gradnorm_update.weights = [1.0] * len(losses)
+
+    norms: List[torch.Tensor] = []
+    for loss in losses:
+        grads = torch.autograd.grad(
+            loss,
+            params,
+            retain_graph=True,
+            create_graph=True,
+            allow_unused=True,
+        )
+        valid = [gradient.norm() for gradient in grads if gradient is not None]
+        norms.append(torch.stack(valid).mean() if valid else loss.new_tensor(1e-8))
+
+    mean_norm = torch.stack(norms).mean().detach()
+    updated: List[torch.Tensor] = []
+    for old_weight, initial_loss, loss, norm in zip(
+        gradnorm_update.weights,
+        gradnorm_update.init_losses,
+        losses,
+        norms,
+    ):
+        relative = (loss / initial_loss).detach().clamp_min(1e-8)
+        updated.append(
+            (old_weight * relative.pow(eta) * (mean_norm / norm.clamp_min(1e-8)).detach()).clamp(min=1e-3)
+        )
+
+    scale = sum(updated)
+    normalized = [value / scale for value in updated]
+    gradnorm_update.weights = normalized
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# Data and checkpoint I/O
+# ---------------------------------------------------------------------------
+def preprocess_cfo_file(path: str) -> Tuple[np.ndarray, np.ndarray, float, float]:
+    raw = np.loadtxt(path, dtype=str, delimiter="\t")
+    np.random.shuffle(raw)
+    raw = np.char.replace(raw, "i", "j").astype(np.complex64)
+
+    signals: List[np.ndarray] = []
+    labels: List[float] = []
+    eps = np.finfo(np.float32).eps
+    for line in raw:
+        data = line[:INPUT_IQ_SAMPLES]
+        label = float(np.real(line[-1]))
+        centered = detrend(data - np.mean(data))
+        real = np.real(centered).astype(np.float32)
+        imag = np.imag(centered).astype(np.float32)
+        real_rms = max(float(np.sqrt(np.mean(real ** 2))), eps)
+        imag_rms = max(float(np.sqrt(np.mean(imag ** 2))), eps)
+        signals.append(np.stack((real / real_rms, imag / imag_rms), axis=0))
+        labels.append(label)
+
+    x = np.stack(signals).astype(np.float32)
+    y_raw = np.asarray(labels, dtype=np.float32)
+    y_min = float(y_raw.min())
+    y_max = float(y_raw.max())
+    if not y_max > y_min:
+        raise ValueError("CFO labels must span a nonzero range")
+    y = ((y_raw - y_min) / (y_max - y_min)).reshape(-1, 1).astype(np.float32)
+    return x, y, y_min, y_max
+
+
+def apply_cutout(inputs: torch.Tensor, automatic: bool, num_lost: int) -> torch.Tensor:
+    mask = torch.ones_like(inputs)
+    for i in range(inputs.shape[0]):
+        position = int(torch.randint(1, 6, (1,), device=inputs.device).item()) if automatic else int(num_lost)
+        if position < 1 or position > 5:
+            raise ValueError("num_lost must be in [1,5]")
+        mask[i, :, : 32 * (position - 1)] = 0
+    return inputs * mask
+
+
+def save_checkpoint(path: str, net: Net, y_min: float, y_max: float, extra: Optional[Dict[str, Any]] = None) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload: Dict[str, Any] = {
+        "format_version": CHECKPOINT_VERSION,
+        "model_config": net.config,
+        "model_state": net.state_dict(),
+        "y_min": float(y_min),
+        "y_max": float(y_max),
+    }
+    if extra:
+        payload["extra"] = extra
+    torch.save(payload, target)
+
+
+def load_checkpoint(path: str, device: torch.device | str) -> Tuple[Net, Dict[str, Any]]:
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if not isinstance(checkpoint, dict) or checkpoint.get("format_version") != CHECKPOINT_VERSION:
+        raise RuntimeError(
+            "This script requires a version-2 state-dict checkpoint. The previous whole-model checkpoint "
+            "was produced by an implementation without functional Conv-EE/minimum-error MoE labels and "
+            "must be retrained with the synchronized training script."
+        )
+    net = Net(**checkpoint["model_config"]).to(device)
+    net.load_state_dict(checkpoint["model_state"], strict=True)
+    net.y_min = float(checkpoint["y_min"])
+    net.y_max = float(checkpoint["y_max"])
+    return net, checkpoint
+
+
+# ---------------------------------------------------------------------------
+# Training entry point
+# ---------------------------------------------------------------------------
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    device = configure_device(args.gpu, args.spare_gpu, args.seed)
+
+    x_np, y_np, y_min, y_max = preprocess_cfo_file(args.train_file)
+    x = torch.tensor(x_np, device=device)
+    y = torch.tensor(y_np, device=device)
+    dataset = torch.utils.data.TensorDataset(x, y)
+
+    generator = torch.Generator().manual_seed(args.seed)
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size], generator=generator
+    )
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=True, drop_last=True
+    )
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=args.batch_size, shuffle=False, drop_last=False
+    )
+
+    net = Net(
+        conv_channels=args.conv_channels,
+        linear_dims=args.linear_dims,
+        number_of_blocks_1=args.num_blocks_1,
+        number_of_blocks_2=args.num_blocks_2,
+        num_steps=args.num_steps,
+    ).to(device)
+    net.y_min, net.y_max = y_min, y_max
+
+    try:
+        import torch_optimizer as torch_optim
+
+        optimizer: optim.Optimizer = torch_optim.Lookahead(
+            optim.RAdam(net.parameters(), lr=args.learning_rate)
+        )
+    except ImportError:
+        print("[warning] torch_optimizer is unavailable; using torch.optim.RAdam without Lookahead.")
+        optimizer = optim.RAdam(net.parameters(), lr=args.learning_rate)
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=0.5,
+        patience=args.schedular_patience,
+    )
+    mse = nn.MSELoss()
+
+    flop_summary = summarize_flops(net)
+    print(
+        "Analytical full-reference FLOPs: "
+        f"{flop_summary['full_reference_flops']:.0f}; full-path routing FLOPs: "
+        f"{flop_summary['full_path_gate_flops']:.0f} "
+        f"({flop_summary['gate_fraction_of_full_percent']:.3f}% of full reference)."
+    )
+
+    best_val_loss = math.inf
+    best_state: Optional[Dict[str, torch.Tensor]] = None
+    epochs_without_improvement = 0
+    tau0, tau_min, tau_gamma = 5.0, 0.3, 0.96
+
+    # Reset persistent state if main() is invoked repeatedly in one process.
+    for attr in ("init_losses", "weights"):
+        if hasattr(gradnorm_update, attr):
+            delattr(gradnorm_update, attr)
+
+    for epoch in range(args.n_epochs):
         net.train()
-        train_losses = []
+        train_losses: List[float] = []
+        routing_correct = [0, 0]
+        routing_total = [0, 0]
+
         for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-
             if args.cutout:
-                # inputs: [B, 2, 160]
-                input_mask = torch.ones_like(inputs, device=device)
-                for i in range(inputs.size(0)):
-                    if args.auto:
-                        pos = torch.randint(1, 6, (1,), device=device).item()  # 1~5
-                    else:
-                        pos = args.num_lost
+                inputs = apply_cutout(inputs, args.auto, args.num_lost)
 
-                    input_mask[i, :, :32 * (pos - 1)] = 0
+            optimizer.zero_grad(set_to_none=True)
+            output = net(inputs)
 
-                inputs = inputs * input_mask
+            l_main = torch.sqrt(mse(output.prediction, labels) + 1e-8)
+            l_ea = torch.sqrt(mse(output.exit_prediction, labels) + 1e-8)
 
-            optimizer.zero_grad()
+            selected_exit = (output.linear_depth == 1).nonzero(as_tuple=True)[0]
+            l_ef = output.exit_prediction.sum() * 0.0
+            if selected_exit.numel() > 0:
+                full_prediction = output.depth_predictions[:, 1:2]
+                l_ef = torch.sqrt(
+                    mse(
+                        output.exit_prediction[selected_exit],
+                        full_prediction[selected_exit].detach(),
+                    )
+                    + 1e-8
+                )
 
-            y_final, y_exit1, depth, y_stack, f_exit, f_final, gate_logits, width_logits, expert_logits = net(inputs)
+            projected_exit = net.proj_feat(output.exit_feature)
+            l_fc = torch.sqrt(mse(projected_exit, output.full_feature.detach()) + 1e-8)
 
-            # Compute expected energy cost
-            # ----- 폭 게이트 -----
-            E_width_J = torch.stack([
-                compute_expected_energy(logit,
-                                        width_ops_MACs,  # 길이 K_w
-                                        tau=blk.core[0].tau.item())
-                for logit, blk in zip(width_logits, net.conv_blocks[1:])
-            ]).sum()
+            weights = gradnorm_update([l_ea, l_ef, l_fc], list(net.parameters()), eta=args.eta)
+            l_exit = weights[0] * l_ea + weights[1] * l_ef + weights[2] * l_fc
 
-            # ----- 익스퍼트 게이트 -----
-            E_expert_J = torch.stack([
-                compute_expected_energy_precalc(
-                    logit,
-                    expert_energy_pJ_list[i],  # ← 블록별 리스트!
-                    tau=lb.tau.item())
-                for i, (logit, lb) in enumerate(zip(expert_logits, net.linear_blocks))
-            ]).sum()
+            moe_losses: List[torch.Tensor] = []
+            for block_idx, (candidate_pred, gate_logits) in enumerate(
+                zip(output.expert_candidate_predictions, output.expert_logits)
+            ):
+                if candidate_pred is None:
+                    raise RuntimeError("Training must return both expert predictions for routing labels.")
+                route_label = minimum_error_expert_labels(candidate_pred, labels)
+                moe_losses.append(binary_expert_routing_loss(gate_logits, route_label))
+                predicted_route = gate_logits.detach().argmax(dim=1)
+                routing_correct[block_idx] += int((predicted_route == route_label).sum().item())
+                routing_total[block_idx] += int(route_label.numel())
+            l_gate = torch.stack(moe_losses).mean()
 
-            # ----- 깊이 게이트 -----
-            E_depth_J = compute_expected_energy(gate_logits,
-                                                depth_ops_MACs,  # 길이 K_d
-                                                tau=net.depth_gate.tau.item())
-
-            E_total_J = E_width_J + E_expert_J + E_depth_J
-
-            # ── (1) Main & Aux RMSE ─────────────────
-            L_main = torch.sqrt(loss_fn(y_final, labels) + 1e-8)
-            L_aux = torch.sqrt(loss_fn(y_exit1, labels) + 1e-8)
-            L_each = torch.sqrt(F.mse_loss(y_stack, labels.squeeze(1).unsqueeze(1).expand_as(y_stack), reduction='none') + 1e-8)  # 각 depth별 loss
-
-            # ── (2) Gate-Aware KD (depth==1 샘플만) ─
-            sel1 = (depth == 1).nonzero(as_tuple=True)[0]
-            KD = torch.tensor(0., device=device)
-
-            if sel1.numel():
-                # soft targets with temperature T
-                KD = args.beta * torch.sqrt(loss_fn(y_exit1[sel1], y_final[sel1].detach()) + 1e-8)
-
-            feat_t = f_final.detach()  # (B,32)
-            feat_s = net.proj_feat(f_exit)  # (B,32)
-            L_feat = args.gamma * torch.sqrt(loss_fn(feat_s, feat_t)+ 1e-8)  # feature hint loss
-
-            loss_list = [L_aux, KD, L_feat]
-            weight_vec = gradnorm_update(loss_list, net.parameters(), eta=args.eta)
-            alpha, beta, gamma = weight_vec  # replace args.*
-            # alpha, beta, gamma = 1.0, 1.0, 1.0
-
-            routing_label = torch.argmin(L_each, dim=1)
-            routing_ce = F.cross_entropy(gate_logits, routing_label)
-
-            loss = L_main + alpha * L_aux + beta * KD + gamma * L_feat + args.delta * routing_ce + args.epsilon * E_total_J
+            l_energy = expected_energy_loss(output, net)
+            loss = l_main + l_exit + args.delta * l_gate + args.epsilon * l_energy
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    f"Non-finite loss: main={l_main.item()}, exit={l_exit.item()}, "
+                    f"gate={l_gate.item()}, energy={l_energy.item()}"
+                )
 
             loss.backward()
-
             nn.utils.clip_grad_norm_(net.parameters(), max_norm=args.gradient_max_norm)
             optimizer.step()
+            functional.reset_net(net)
+            train_losses.append(float(loss.item()))
 
-            sched_tau = max(tau_min, tau0 * (tau_gamma ** epoch))
-            anneal_and_clamp_tau(net, sched_tau)
+        scheduled_tau = max(tau_min, tau0 * (tau_gamma ** epoch))
+        anneal_and_clamp_tau(net, scheduled_tau)
+        average_train_loss = float(np.mean(train_losses))
 
-            train_losses.append(loss.item())
-
-        avg_train_loss = sum(train_losses) / len(train_losses)
-
-        # Validation phase
         net.eval()
-        val_losses = []
-        val_mae = []
-        with torch.no_grad():
+        val_losses: List[float] = []
+        val_maes: List[float] = []
+        with torch.inference_mode():
             for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-
                 if args.cutout:
-                    # inputs: [B, 2, 160]
-                    input_mask = torch.ones_like(inputs, device=device)
-                    for i in range(inputs.size(0)):
-                        if args.auto:
-                            pos = torch.randint(1, 6, (1,), device=device).item()  # 1~5
-                        else:
-                            pos = args.num_lost
+                    inputs = apply_cutout(inputs, args.auto, args.num_lost)
+                output = net(inputs)
+                val_losses.append(float(torch.sqrt(mse(output.prediction, labels) + 1e-8).item()))
+                val_maes.append(float(torch.mean(torch.abs(output.prediction - labels)).item()))
+                functional.reset_net(net)
 
-                        input_mask[i, :, :32 * (pos - 1)] = 0
+        average_val_loss = float(np.mean(val_losses))
+        denormalized_val_mae = float(np.mean(val_maes)) * (y_max - y_min)
+        scheduler.step(average_val_loss)
+        route_acc = [
+            (routing_correct[i] / routing_total[i]) if routing_total[i] else float("nan")
+            for i in range(2)
+        ]
+        print(
+            f"Epoch {epoch + 1}/{args.n_epochs} - Train loss: {average_train_loss:.5f} - "
+            f"Val RMSE: {average_val_loss:.5f} - Val MAE: {denormalized_val_mae:.2f} Hz - "
+            f"MoE route acc: block1={route_acc[0]:.3f}, block2={route_acc[1]:.3f}"
+        )
 
-                    inputs = inputs * input_mask
+        if average_val_loss < best_val_loss:
+            best_val_loss = average_val_loss
+            best_state = copy.deepcopy(net.state_dict())
+            epochs_without_improvement = 0
+            save_checkpoint(
+                args.model_path,
+                net,
+                y_min,
+                y_max,
+                extra={"epoch": epoch + 1, "best_val_rmse": best_val_loss},
+            )
+        else:
+            epochs_without_improvement += 1
 
-                outputs = net(inputs)[0]
+        if args.early_stop and epochs_without_improvement >= args.es_patience:
+            print(f"Early stopping triggered at epoch {epoch + 1}.")
+            break
 
-                loss_val = torch.sqrt(loss_fn(outputs, labels.float()) + 1e-8)
-                mae_val = torch.mean(torch.abs(outputs - labels))
-                val_losses.append(loss_val.item())
-                val_mae.append(mae_val.item())
+    if best_state is None:
+        raise RuntimeError("Training finished without a valid checkpoint.")
+    net.load_state_dict(best_state)
+    save_checkpoint(
+        args.model_path,
+        net,
+        y_min,
+        y_max,
+        extra={"best_val_rmse": best_val_loss},
+    )
+    print(f"Saved synchronized SDyNN checkpoint to: {args.model_path}")
 
-        avg_val_loss = sum(val_losses) / len(val_losses)
-        avg_val_mae = sum(val_mae) / len(val_mae)
-        denorm_val_mae = avg_val_mae * (y_max - y_min)
-        scheduler.step(avg_val_loss)
 
-        print(f"Epoch {epoch+1}/{n_epochs} - Val RMSE: {avg_val_loss:.4f}, Val MAE (denorm): {denorm_val_mae:.4f}")
-
-        # Early stopping
-        if args.early_stop:
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
-                epochs_no_improve = 0
-                best_model_state = net.state_dict()
-            else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= args.es_patience:
-                    print(f"Early stopping triggered at epoch {epoch+1}")
-                    net.load_state_dict(best_model_state)
-                    torch.save(net, "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/ablation/incomplete/cfo_scnn_wireless_eps(0.5).pt")
-                    break
-
-    # torch.save(net, "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/cfo_scnn_wireless.pt")
+if __name__ == "__main__":
+    main()

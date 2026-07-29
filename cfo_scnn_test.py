@@ -1,198 +1,160 @@
+"""Evaluate a synchronized SDyNN checkpoint.
+
+Inference is deterministic: all routers use argmax and execute only the selected
+Conv-EE/linear-EE paths, widths, and SNN/DNN experts.
+"""
+
+from __future__ import annotations
+
+import argparse
 import os
 import sys
-import gc
+from pathlib import Path
+from typing import Any, List, Tuple
+
 import numpy as np
 from scipy.signal import detrend
-import argparse
-
-from spikingjelly.activation_based import functional, neuron, monitor
 import torch
+from spikingjelly.activation_based import functional
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", type=int, default=128)
-parser.add_argument("--cutout", type=bool, default=False)
-parser.add_argument("--auto", type=bool, default=True)
-parser.add_argument("--num_lost", type=int, default=1) # if auto is False, 1 ~ 5
-parser.add_argument("--gpu", dest="gpu", action="store_true")
-parser.add_argument("--spare_gpu", dest="spare_gpu", default=0)
-parser.set_defaults(gpu=True)
-args = parser.parse_args()
 
-seed = torch.initial_seed()
-batch_size = args.batch_size
-gpu = args.gpu
-spare_gpu = args.spare_gpu
+def str2bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid Boolean value: {value!r}")
 
-# Set up GPU usage
-gc.collect()
-torch.cuda.empty_cache()
-if spare_gpu != 0:
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(spare_gpu)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if gpu and torch.cuda.is_available():
-    torch.cuda.manual_seed_all(seed)
-else:
-    torch.manual_seed(seed)
-    device = "cpu"
-    if gpu:
-        gpu = False
-torch.set_num_threads(os.cpu_count() - 1)
 
-# Add the directory containing the training file to sys.path
-# (Assuming cfo_scnn_train.py is located in "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO")
-sys.path.append("/SNN/CFO/train")
-import cfo_scnn_train  # This module contains the Net class
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--cutout", type=str2bool, default=False)
+    parser.add_argument("--auto", type=str2bool, default=False)
+    parser.add_argument("--num_lost", type=int, default=1)
+    parser.add_argument("--gpu", type=str2bool, default=True)
+    parser.add_argument("--spare_gpu", type=int, default=0)
+    parser.add_argument("--shuffle_test", type=str2bool, default=False)
+    parser.add_argument("--report_flops", type=str2bool, default=True)
+    parser.add_argument(
+        "--train_module_dir",
+        type=str,
+        default="/SNN/CFO/train",
+        help="Directory containing cfo_scnn_train.py",
+    )
+    parser.add_argument(
+        "--test_file",
+        type=str,
+        default=(
+            "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/802.11ax_synth_changing/"
+            "WiFi_20MHz_L-STF_ax_cfo_rapid_chg4_mixed_test.txt"
+        ),
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=(
+            "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/complete/"
+            "cfo_scnn_wireless_ax_changing.pt"
+        ),
+    )
+    return parser
 
-# Trick pickle to find the Net class by mapping __main__ to the training module
-sys.modules["__main__"] = cfo_scnn_train
 
-# Load test dataset from file
-fname_test = ("/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/"
-              "WiFi_10MHz_Preambles_wireless_cfo_test_18dB.txt")
+def configure_device(gpu: bool, spare_gpu: int) -> torch.device:
+    if spare_gpu != 0:
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(spare_gpu)
+    return torch.device("cuda" if gpu and torch.cuda.is_available() else "cpu")
 
-raw_test = np.loadtxt(fname_test, dtype='str', delimiter='\t')
-np.random.shuffle(raw_test)
-for i in range(len(raw_test)):
-    for j in range(len(raw_test[i])):
-        raw_test[i][j] = raw_test[i][j].replace('i', 'j')
-raw_test = raw_test.astype(np.complex64)
 
-# Remove DC offsets and prepare test signals
-test_signals = []
-for line in raw_test:
+def load_test_file(path: str, shuffle: bool) -> Tuple[np.ndarray, np.ndarray]:
+    raw = np.loadtxt(path, dtype=str, delimiter="\t")
+    if shuffle:
+        np.random.shuffle(raw)
+    raw = np.char.replace(raw, "i", "j").astype(np.complex64)
 
-    # Extract the last 'input_size' samples from the full preamble
-    line_data = line[0:160]
-    line_label = np.real(line[-1])
-    dcr = detrend(line_data - np.mean(line_data))
-    real = np.real(dcr).astype(np.float32)
-    imag = np.imag(dcr).astype(np.float32)
-    real_rms = np.sqrt(np.sum(np.power(np.abs(real), 2)) / 160)
-    imag_rms = np.sqrt(np.sum(np.power(np.abs(imag), 2)) / 160)
+    signals: List[np.ndarray] = []
+    labels: List[float] = []
+    eps = np.finfo(np.float32).eps
+    for line in raw:
+        data = line[:160]
+        centered = detrend(data - np.mean(data))
+        real = np.real(centered).astype(np.float32)
+        imag = np.imag(centered).astype(np.float32)
+        real_rms = max(float(np.sqrt(np.mean(real ** 2))), eps)
+        imag_rms = max(float(np.sqrt(np.mean(imag ** 2))), eps)
+        signals.append(np.stack((real / real_rms, imag / imag_rms), axis=0))
+        labels.append(float(np.real(line[-1])))
+    return np.stack(signals).astype(np.float32), np.asarray(labels, dtype=np.float32)
 
-    # Concatenate into flat 320-dim vector (first 160: real, next 160: imag)
-    # whole = np.stack([real, imag], axis=0)
-    whole = np.stack([real / real_rms, imag / imag_rms], axis=0)
-    test_signals.append((whole, float(line_label)))
 
-test_x = torch.tensor(np.stack([i[0] for i in test_signals]), device=device)
-test_y = torch.tensor(np.expand_dims(np.stack([i[1] for i in test_signals]), axis=1), device=device)
+def segment_maes(prediction: np.ndarray, target: np.ndarray, segments: int = 10) -> List[float]:
+    indices = np.array_split(np.arange(target.size), segments)
+    return [float(np.mean(np.abs(prediction[idx] - target[idx]))) for idx in indices if idx.size > 0]
 
-# Obtain y_min and y_max from test labels (for denormalization)
-y_max = test_y.max().item()
-y_min = test_y.min().item()
 
-# Create test DataLoader
-test_dataset = torch.utils.data.TensorDataset(test_x, test_y)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, drop_last=True)
+def main() -> None:
+    args = build_parser().parse_args()
+    device = configure_device(args.gpu, args.spare_gpu)
 
-# Define measurement function
-def MAE(y, y_hat):
-    return np.mean(np.abs(y - y_hat))
+    train_dir = str(Path(args.train_module_dir).resolve())
+    if train_dir not in sys.path:
+        sys.path.insert(0, train_dir)
+    from cfo_scnn_train import apply_cutout, estimate_inference_flops, load_checkpoint
 
-# Load the entire saved model (the entire model was saved as .pt)
-model_path = "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/complete/cfo_scnn_wireless.pt"
-net = torch.load(model_path, map_location=device, weights_only=False)
-net.to(device)
+    x_np, y_np = load_test_file(args.test_file, args.shuffle_test)
+    dataset = torch.utils.data.TensorDataset(torch.from_numpy(x_np), torch.from_numpy(y_np).unsqueeze(1))
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
 
-# Define firing rate monitor
-def cal_firing_rate(s_seq: torch.Tensor):
-    return s_seq.flatten(1).mean(1)
-fr_monitor = monitor.OutputMonitor(net, neuron.IFNode, cal_firing_rate)
-fr_monitor.clear_recorded_data()
+    net, checkpoint = load_checkpoint(args.model_path, device)
+    net.eval()
+    y_min = float(checkpoint["y_min"])
+    y_max = float(checkpoint["y_max"])
 
-net.eval()
-test_outputs = []
-test_labels = []
+    predictions: List[np.ndarray] = []
+    labels: List[np.ndarray] = []
+    flop_batches: List[torch.Tensor] = []
 
-# Testing loop
-for inputs, labels in test_loader:
-    inputs, labels = inputs.to(device), labels.to(device)
+    with torch.inference_mode():
+        for inputs, target in loader:
+            inputs = inputs.to(device)
+            if args.cutout:
+                inputs = apply_cutout(inputs, args.auto, args.num_lost)
+            output = net(inputs)
+            prediction_hz = output.prediction * (y_max - y_min) + y_min
+            predictions.append(prediction_hz.cpu().numpy())
+            labels.append(target.numpy())
+            if args.report_flops:
+                flop_batches.append(estimate_inference_flops(output, net))
+            functional.reset_net(net)
 
-    if args.cutout:
-        # inputs: [B, 2, 160]
-        input_mask = torch.ones_like(inputs, device=device)
-        for i in range(inputs.size(0)):
-            if args.auto:
-                pos = torch.randint(1, 6, (1,), device=device).item()  # 1~5
-            else:
-                pos = args.num_lost
+    prediction = np.concatenate(predictions, axis=0).reshape(-1)
+    target = np.concatenate(labels, axis=0).reshape(-1)
+    if prediction.shape != target.shape:
+        raise RuntimeError(f"Prediction/target shape mismatch: {prediction.shape} vs {target.shape}")
 
-            input_mask[i, :, :32 * (pos - 1)] = 0
+    for index, value in enumerate(segment_maes(prediction, target), start=1):
+        print(f"MAE segment {index}: {value:.4f} Hz")
+    print(f"Average MAE: {np.mean(np.abs(prediction - target)):.4f} Hz")
+    print(f"Evaluated samples: {target.size}")
 
-        inputs = inputs * input_mask
+    if flop_batches:
+        flops = torch.cat(flop_batches)
+        print(
+            "Actual route-dependent FLOPs per sample: "
+            f"mean={flops.mean().item():.2f}, min={flops.min().item():.2f}, "
+            f"max={flops.max().item():.2f}"
+        )
 
-    # test_outputs.append(net(inputs).cpu().detach().numpy())
-    test_outputs.append(net(inputs)[0].cpu().detach().numpy())
-    test_labels.append(labels.cpu().detach().numpy())
-    functional.reset_net(net)
 
-# Denormalize predictions: MAE denormalization for differences only requires multiplication by (y_max - y_min)
-test_outputs = np.array(test_outputs).squeeze().reshape(1, -1).squeeze() * (y_max - y_min) + y_min
-test_labels = np.array(test_labels).squeeze().reshape(1, -1).squeeze()
-
-# Compute MAE for segments and overall
-test_outputs_1 = test_outputs[0:500]
-test_labels_1 = test_labels[0:500]
-test_outputs_2 = test_outputs[500:1000]
-test_labels_2 = test_labels[500:1000]
-test_outputs_3 = test_outputs[1000:1500]
-test_labels_3 = test_labels[1000:1500]
-test_outputs_4 = test_outputs[1500:2000]
-test_labels_4 = test_labels[1500:2000]
-test_outputs_5 = test_outputs[2000:2500]
-test_labels_5 = test_labels[2000:2500]
-test_outputs_6 = test_outputs[2500:3000]
-test_labels_6 = test_labels[2500:3000]
-test_outputs_7 = test_outputs[3000:3500]
-test_labels_7 = test_labels[3000:3500]
-test_outputs_8 = test_outputs[3500:4000]
-test_labels_8 = test_labels[3500:4000]
-test_outputs_9 = test_outputs[4000:4500]
-test_labels_9 = test_labels[4000:4500]
-test_outputs_10 = test_outputs[4500:5000]
-test_labels_10 = test_labels[4500:5000]
-
-mae_1 = MAE(test_outputs_1, test_labels_1)
-mae_2 = MAE(test_outputs_2, test_labels_2)
-mae_3 = MAE(test_outputs_3, test_labels_3)
-mae_4 = MAE(test_outputs_4, test_labels_4)
-mae_5 = MAE(test_outputs_5, test_labels_5)
-mae_6 = MAE(test_outputs_6, test_labels_6)
-mae_7 = MAE(test_outputs_7, test_labels_7)
-mae_8 = MAE(test_outputs_8, test_labels_8)
-mae_9 = MAE(test_outputs_9, test_labels_9)
-mae_10 = MAE(test_outputs_10, test_labels_10)
-mae = MAE(test_outputs, test_labels)
-
-print(f"MAE segment 1: {mae_1.item()}")
-print(f"MAE segment 2: {mae_2.item()}")
-print(f"MAE segment 3: {mae_3.item()}")
-print(f"MAE segment 4: {mae_4.item()}")
-print(f"MAE segment 5: {mae_5.item()}")
-print(f"MAE segment 6: {mae_6.item()}")
-print(f"MAE segment 7: {mae_7.item()}")
-print(f"MAE segment 8: {mae_8.item()}")
-print(f"MAE segment 9: {mae_9.item()}")
-print(f"MAE segment 10: {mae_10.item()}")
-print(f"Average MAE: {mae.item()}")
-
-# Compute average spiking rate from the monitor records
-# spike_rate = fr_monitor.records
-# layer_avg = [torch.mean(rate).item() for rate in spike_rate]
-#
-# if "ConvFC1FC2" in network_type:
-#     l_size = 3
-# elif "ConvFC1" in network_type:
-#     l_size = 2
-# elif "ConvFC2" in network_type:
-#     l_size = 2
-# elif "FC1FC2" in network_type:
-#     l_size = 2
-# else:
-#     l_size = 1
-#
-# layer_avg = np.mean(np.array(layer_avg).reshape(-1, l_size), 0)
-# print(f"Average spiking rate: {layer_avg}")
+if __name__ == "__main__":
+    main()

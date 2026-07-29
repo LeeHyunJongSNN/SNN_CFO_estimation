@@ -1,171 +1,249 @@
+"""Log SDyNN route selections and actual route-dependent FLOPs.
+
+The script reads route metadata returned by the model itself. It no longer
+re-implements the convolution path manually or double-counts the Conv-EE hook.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
 import os
 import sys
-import gc
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
 import numpy as np
 from scipy.signal import detrend
-import argparse
-
-from spikingjelly.activation_based import functional, neuron, monitor
 import torch
-from collections import Counter
+from spikingjelly.activation_based import functional
 
-# Parse command-line arguments
-parser = argparse.ArgumentParser()
-parser.add_argument("--batch_size", type=int, default=128)
-parser.add_argument("--cutout", type=bool, default=True)
-parser.add_argument("--auto", type=bool, default=True)
-parser.add_argument("--num_lost", type=int, default=1)
-parser.add_argument("--gpu", dest="gpu", action="store_true")
-parser.add_argument("--spare_gpu", dest="spare_gpu", default=0)
-parser.set_defaults(gpu=True)
-args = parser.parse_args()
 
-# Setup seeds and device
-gc.collect()
-torch.cuda.empty_cache()
-if args.spare_gpu:
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(args.spare_gpu)
-device = torch.device("cuda" if torch.cuda.is_available() and args.gpu else "cpu")
-seed = torch.initial_seed()
-if device.type == "cuda":
-    torch.cuda.manual_seed_all(seed)
-else:
-    torch.manual_seed(seed)
-torch.set_num_threads(os.cpu_count() - 1)
+def str2bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid Boolean value: {value!r}")
 
-# Import Net
-sys.path.append("/SNN/CFO/train")
-import cfo_scnn_train
-sys.modules["__main__"] = cfo_scnn_train
 
-# Load dataset
-data_path = "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/WiFi_10MHz_Preambles_wireless_cfo_test_rician_18dB.txt"
-raw = np.loadtxt(data_path, dtype=str, delimiter='\t')
-np.random.shuffle(raw)
-for i in range(raw.shape[0]):
-    raw[i] = [x.replace('i','j') for x in raw[i]]
-raw = raw.astype(np.complex64)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--cutout", type=str2bool, default=True)
+    parser.add_argument("--auto", type=str2bool, default=True)
+    parser.add_argument("--num_lost", type=int, default=1)
+    parser.add_argument("--gpu", type=str2bool, default=True)
+    parser.add_argument("--spare_gpu", type=int, default=0)
+    parser.add_argument("--shuffle_test", type=str2bool, default=False)
+    parser.add_argument("--train_module_dir", type=str, default="/SNN/CFO/train")
+    parser.add_argument(
+        "--test_file",
+        type=str,
+        default=(
+            "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/"
+            "WiFi_10MHz_Preambles_wireless_cfo_test_rician_18dB.txt"
+        ),
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default=(
+            "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/incomplete/"
+            "cfo_scnn_wireless.pt"
+        ),
+    )
+    return parser
 
-# Preprocess
-test_x, test_y = [], []
-for line in raw:
-    data, label = line[:160], np.real(line[-1])
-    d = detrend(data - data.mean())
-    real = np.real(d).astype(np.float32)
-    imag = np.imag(d).astype(np.float32)
-    real_rms = np.sqrt((real ** 2).mean())
-    imag_rms = np.sqrt((imag ** 2).mean())
-    test_x.append(np.stack([real/real_rms, imag/imag_rms], axis=0))
-    test_y.append(float(label))
 
-# Tensor and loader
-test_x = torch.tensor(np.stack(test_x), device=device)
-test_y = torch.tensor(test_y, device=device).unsqueeze(1)
-from torch.utils.data import DataLoader, TensorDataset
-loader = DataLoader(TensorDataset(test_x, test_y), batch_size=args.batch_size, shuffle=False)
+def configure_device(gpu: bool, spare_gpu: int) -> torch.device:
+    if spare_gpu != 0:
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(spare_gpu)
+    return torch.device("cuda" if gpu and torch.cuda.is_available() else "cpu")
 
-y_max, y_min = test_y.max().item(), test_y.min().item()
 
-# Load model
-model_file = "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO/models/incomplete/cfo_scnn_wireless.pt"
-net = torch.load(model_file, map_location=device, weights_only=False)
-net.to(device)
-net.eval()
+def load_test_file(path: str, shuffle: bool) -> Tuple[np.ndarray, np.ndarray]:
+    raw = np.loadtxt(path, dtype=str, delimiter="\t")
+    if shuffle:
+        np.random.shuffle(raw)
+    raw = np.char.replace(raw, "i", "j").astype(np.complex64)
 
-# Prepare stats
-num_conv = len(net.conv_blocks)
-num_lin = len(net.linear_blocks)
-stats = {
-    'depth_conv': [],
-    'depth_linear': [],
-    'width_logits': [[] for _ in range(num_conv-1)],
-    'expert_logits': [[] for _ in range(num_lin)]
-}
+    signals: List[np.ndarray] = []
+    labels: List[float] = []
+    eps = np.finfo(np.float32).eps
+    for line in raw:
+        data = line[:160]
+        centered = detrend(data - np.mean(data))
+        real = np.real(centered).astype(np.float32)
+        imag = np.imag(centered).astype(np.float32)
+        real_rms = max(float(np.sqrt(np.mean(real ** 2))), eps)
+        imag_rms = max(float(np.sqrt(np.mean(imag ** 2))), eps)
+        signals.append(np.stack((real / real_rms, imag / imag_rms), axis=0))
+        labels.append(float(np.real(line[-1])))
+    return np.stack(signals).astype(np.float32), np.asarray(labels, dtype=np.float32)
 
-# Hooks for depth gates
-def hook_depth_conv(mod, inp, out):
-    depth, *_ = out
-    stats['depth_conv'].extend(depth.cpu().tolist())
 
-def hook_depth_linear(mod, inp, out):
-    depth, *_ = out
-    stats['depth_linear'].extend(depth.cpu().tolist())
+def print_counter(title: str, values: List[int], labels: Dict[int, str]) -> None:
+    print(f"\n-- {title} --")
+    counts = Counter(values)
+    total = sum(counts.values())
+    for key in sorted(counts):
+        name = labels.get(key, str(key))
+        proportion = counts[key] / total if total else float("nan")
+        print(f"{name}: {counts[key]} ({proportion:.4f})")
 
-net.depth_gate_conv.register_forward_hook(hook_depth_conv)
-net.depth_gate.register_forward_hook(hook_depth_linear)
 
-# Optional: OutputMonitor if needed
-fr_monitor = monitor.OutputMonitor(net, neuron.IFNode, lambda s: s.flatten(1).mean(1))
-fr_monitor.clear_recorded_data()
+def main() -> None:
+    args = build_parser().parse_args()
+    device = configure_device(args.gpu, args.spare_gpu)
 
-# Run test
-preds = []
-labels = []
-for x_batch, y_batch in loader:
-    x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-    B = x_batch.size(0)
+    train_dir = str(Path(args.train_module_dir).resolve())
+    if train_dir not in sys.path:
+        sys.path.insert(0, train_dir)
+    from cfo_scnn_train import (
+        apply_cutout,
+        estimate_inference_flops,
+        estimate_inference_gate_flops,
+        gate_only_full_path_cost,
+        load_checkpoint,
+        summarize_flops,
+    )
 
-    # Conv-stage depth adaptation: manual replication of forward's conv stage and depth gating
-    with torch.no_grad():
-        x_conv = x_batch.view(B, 2, 10, 16)  # reshape as in Net.forward fileciteturn5file7
-        feat = x_conv
-        for blk in net.conv_blocks:
-            feat = blk(feat)
-        gap_feat = net.conv_gap(feat).view(B, -1)
-        depth_conv_batch, _ = net.depth_gate_conv(gap_feat)
-        stats['depth_conv'].extend(depth_conv_batch.cpu().tolist())
+    x_np, y_np = load_test_file(args.test_file, args.shuffle_test)
+    dataset = torch.utils.data.TensorDataset(torch.from_numpy(x_np), torch.from_numpy(y_np).unsqueeze(1))
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
 
-    # Apply cutout if enabled
-    if args.cutout:
-        mask = torch.ones_like(x_batch)
-        for i in range(B):
-            pos = torch.randint(1,6,(1,),device=device).item() if args.auto else args.num_lost
-            mask[i,:, :32*(pos-1)] = 0
-        x_batch = x_batch * mask
+    net, checkpoint = load_checkpoint(args.model_path, device)
+    net.eval()
+    y_min = float(checkpoint["y_min"])
+    y_max = float(checkpoint["y_max"])
 
-    # Forward pass captures linear depth (via hook), width & expert logits
-    out = net(x_batch)
-    y_hat = out[0]
-    w_logits = out[-2]
-    e_logits = out[-1]
+    conv_depths: List[int] = []
+    linear_depths: List[int] = []
+    width_indices: List[int] = []
+    expert_1: List[int] = []
+    expert_2: List[int] = []
+    predictions: List[np.ndarray] = []
+    targets: List[np.ndarray] = []
+    flops_all: List[torch.Tensor] = []
+    gate_flops_all: List[torch.Tensor] = []
+    route_keys: List[Tuple[int, int, int, int, int]] = []
 
-    preds.append(y_hat.cpu().detach().numpy())
-    labels.append(y_batch.cpu().detach().numpy())
-    for i, w in enumerate(w_logits): stats['width_logits'][i].append(w.cpu().detach().numpy())
-    for i, e in enumerate(e_logits): stats['expert_logits'][i].append(e.cpu().detach().numpy())
+    with torch.inference_mode():
+        for inputs, target in loader:
+            inputs = inputs.to(device)
+            if args.cutout:
+                inputs = apply_cutout(inputs, args.auto, args.num_lost)
 
-    functional.reset_net(net)
+            output = net(inputs)
+            route = output.route_info
+            conv_depths.extend(route["conv_depth"].cpu().tolist())
+            linear_depths.extend(route["linear_depth"].cpu().tolist())
+            width_indices.extend(route["width_indices"][0].cpu().tolist())
+            expert_1.extend(route["expert_indices"][0].cpu().tolist())
+            expert_2.extend(route["expert_indices"][1].cpu().tolist())
 
-# Denormalize preds and flatten
-all_preds = np.concatenate(preds,0).squeeze() * (y_max-y_min) + y_min
-all_labels = np.concatenate(labels,0).squeeze()
+            prediction_hz = output.prediction * (y_max - y_min) + y_min
+            predictions.append(prediction_hz.cpu().numpy())
+            targets.append(target.numpy())
+            batch_flops = estimate_inference_flops(output, net)
+            batch_gate_flops = estimate_inference_gate_flops(output, net)
+            flops_all.append(batch_flops)
+            gate_flops_all.append(batch_gate_flops)
 
-# Print depth stats
-print("\n-- Conv-stage Depth Gate Distribution --")
-for d,c in Counter(stats['depth_conv']).items(): print(f"Depth {d/2}: {c/2}")
-print("\n-- Linear-stage Depth Gate Distribution --")
-for d,c in Counter(stats['depth_linear']).items(): print(f"Depth {d}: {c}")
+            batch_conv = route["conv_depth"].cpu().tolist()
+            batch_width = route["width_indices"][0].cpu().tolist()
+            batch_expert_1 = route["expert_indices"][0].cpu().tolist()
+            batch_linear = route["linear_depth"].cpu().tolist()
+            batch_expert_2 = route["expert_indices"][1].cpu().tolist()
+            route_keys.extend(
+                (int(cd), int(wi), int(e1), int(ld), int(e2))
+                for cd, wi, e1, ld, e2 in zip(
+                    batch_conv, batch_width, batch_expert_1, batch_linear, batch_expert_2
+                )
+            )
+            functional.reset_net(net)
 
-# Width gate stats
-print("\n-- Conv Width Filter Counts --")
-for idx, wl in enumerate(stats['width_logits'], start=1):
-    arr = np.vstack(wl)
-    sel = np.argmax(arr,1)
-    blk = net.conv_blocks[idx]
-    widths, max_out = blk.core[0].widths, blk.core[0].max_out
-    cnts = Counter([int(max_out*widths[i]) for i in sel])
-    print(f"Block {idx}:")
-    for num, cnt in cnts.items(): print(f" {num} filters: {cnt}")
+    prediction = np.concatenate(predictions, axis=0).reshape(-1)
+    target = np.concatenate(targets, axis=0).reshape(-1)
 
-# Expert stats
-print("\n-- MoE Expert Selection --")
-for idx, el in enumerate(stats['expert_logits']):
-    arr = np.vstack(el)
-    sel = np.argmax(arr,1)
-    num_dnn = len(net.linear_blocks[idx].dnn_experts)
-    print(f"Block {idx}: DNN {(sel<num_dnn).sum()}, SNN {(sel>=num_dnn).sum()}")
+    print_counter("Convolution-stage depth distribution", conv_depths, {1: "CD1 (early exit)", 2: "CD2 (full)"})
+    print_counter("Linear-stage depth distribution", linear_depths, {1: "LD1 (early exit)", 2: "LD2 (full)"})
 
-# Overall MAE
-mae = np.mean(np.abs(all_preds-all_labels))
-print(f"\n-- Overall MAE: {mae:.4f} --")
+    reached_width = [value for value in width_indices if value >= 0]
+    skipped_width = sum(value < 0 for value in width_indices)
+    width_labels = {
+        index: f"CF{channels}"
+        for index, channels in enumerate(net.conv_blocks[1].core[0].keep_channels)
+    }
+    print_counter("Slimmable width distribution among samples reaching Conv block 2", reached_width, width_labels)
+    print(f"Conv block 2 not reached: {skipped_width}")
+
+    print_counter("MoE selection in linear block 1", expert_1, {0: "SNN", 1: "DNN"})
+    reached_expert_2 = [value for value in expert_2 if value >= 0]
+    skipped_expert_2 = sum(value < 0 for value in expert_2)
+    print_counter("MoE selection in linear block 2 among reached samples", reached_expert_2, {0: "SNN", 1: "DNN"})
+    print(f"Linear block 2 not reached: {skipped_expert_2}")
+
+    mae = float(np.mean(np.abs(prediction - target)))
+    flops = torch.cat(flops_all)
+    gate_flops = torch.cat(gate_flops_all)
+    summary = summarize_flops(net)
+    gate_cost = gate_only_full_path_cost(net)
+
+    print(f"\n-- Overall MAE: {mae:.4f} Hz --")
+    print(f"Evaluated samples: {target.size}")
+    print(
+        "Actual route-dependent FLOPs per sample: "
+        f"mean={flops.mean().item():.2f}, min={flops.min().item():.2f}, "
+        f"max={flops.max().item():.2f}"
+    )
+    mean_total = flops.mean().item()
+    mean_gate = gate_flops.mean().item()
+    print(
+        "Average executed routing overhead: "
+        f"{mean_gate:.2f} FLOPs/sample; {100.0 * mean_gate / mean_total:.4f}% of the "
+        f"average dynamic inference cost; {100.0 * mean_gate / (mean_total - mean_gate):.4f}% "
+        "increase over the corresponding ungated computation."
+    )
+
+    route_counter = Counter(route_keys)
+    most_route, most_count = route_counter.most_common(1)[0]
+    representative_index = route_keys.index(most_route)
+    most_total = flops[representative_index].item()
+    most_gate = gate_flops[representative_index].item()
+    cd, wi, e1, ld, e2 = most_route
+    width_name = "not reached" if wi < 0 else f"CF{net.conv_blocks[1].core[0].keep_channels[wi]}"
+    expert2_name = "not reached" if e2 < 0 else ("SNN" if e2 == 0 else "DNN")
+    print(
+        "Most-selected route: "
+        f"CD{cd}, width={width_name}, block1={'SNN' if e1 == 0 else 'DNN'}, "
+        f"LD{ld}, block2={expert2_name}; count={most_count}/{len(route_keys)} "
+        f"({most_count / len(route_keys):.4f})."
+    )
+    print(
+        "Most-selected-route overhead: "
+        f"total={most_total:.2f} FLOPs, gates={most_gate:.2f} FLOPs, "
+        f"gate share={100.0 * most_gate / most_total:.4f}%, "
+        f"increase over ungated route={100.0 * most_gate / (most_total - most_gate):.4f}%."
+    )
+
+    print(
+        "All full-path routing networks: "
+        f"{gate_cost.flops:.2f} FLOPs; "
+        f"{summary['gate_fraction_of_full_percent']:.4f}% of the analytical full-reference path; "
+        f"{summary['ungated_to_gated_increase_percent']:.4f}% increase over its ungated counterpart."
+    )
+
+
+if __name__ == "__main__":
+    main()
