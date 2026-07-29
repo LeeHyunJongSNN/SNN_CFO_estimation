@@ -36,8 +36,8 @@ torch.set_num_threads(os.cpu_count() - 1)
 
 # Import Net
 sys.path.append("/SNN/CFO/train")
-import cfo_scnn_train
-sys.modules["__main__"] = cfo_scnn_train
+import cfo_scnn_train_v1
+sys.modules["__main__"] = cfo_scnn_train_v1
 
 # Load dataset
 data_path = "/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/WiFi_10MHz_Preambles_wireless_cfo_test_rician_18dB.txt"

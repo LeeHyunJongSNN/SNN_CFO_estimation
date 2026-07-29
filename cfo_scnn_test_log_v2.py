@@ -104,7 +104,7 @@ def main() -> None:
     train_dir = str(Path(args.train_module_dir).resolve())
     if train_dir not in sys.path:
         sys.path.insert(0, train_dir)
-    from cfo_scnn_train import (
+    from cfo_scnn_train_v2 import (
         apply_cutout,
         estimate_inference_flops,
         estimate_inference_gate_flops,

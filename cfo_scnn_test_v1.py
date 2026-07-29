@@ -43,10 +43,10 @@ torch.set_num_threads(os.cpu_count() - 1)
 # Add the directory containing the training file to sys.path
 # (Assuming cfo_scnn_train.py is located in "/home/leehyunjong/PycharmProjects/Machine_Learning/SNN/CFO")
 sys.path.append("/SNN/CFO/train")
-import cfo_scnn_train  # This module contains the Net class
+import cfo_scnn_train_v1  # This module contains the Net class
 
 # Trick pickle to find the Net class by mapping __main__ to the training module
-sys.modules["__main__"] = cfo_scnn_train
+sys.modules["__main__"] = cfo_scnn_train_v1
 
 # Load test dataset from file
 fname_test = ("/home/leehyunjong/Wi-Fi_Preambles/stfcfo/wireless/"
